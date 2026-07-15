@@ -1,0 +1,28 @@
+Time of Attack,Tactic Name,Technique Name
+1701468825.787,Benign,Benign
+1701468825.955,Benign,Benign
+1701468826.123,Benign,Benign
+1701658975.0,cleanup,create staging directory
+1701658975.0,cleanup,create staging directory
+1701658975.0,cleanup,create staging directory
+1701469507.0,collection,create staging directory
+1701469507.0,collection,create staging directory
+1701469537.0,collection,find files
+1701558169.0,command and control,linux download file and run
+1701558169.0,command and control,linux download file and run
+1701558169.0,command and control,linux download file and run
+1701594972.0,credential access,extract password with grep
+1701594972.0,credential access,extract password with grep
+1701594972.0,credential access,extract password with grep
+1701563744.0,discovery,find local users
+1701563744.0,discovery,find local users
+1701563744.0,discovery,find local users
+1701545137.0,exfiltration,compress staged directory
+1701545137.0,exfiltration,compress staged directory
+1701545137.0,exfiltration,compress staged directory
+1701623585.0,lateral movement,start sandcat
+1701623585.0,lateral movement,start sandcat
+1701623585.0,lateral movement,start sandcat
+1701591524.0,persistence,create a new user in linux
+1701591524.0,persistence,create a new user in linux
+1701591524.0,persistence,create a new user in linux
