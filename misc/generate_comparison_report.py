@@ -2,45 +2,61 @@ from pathlib import Path
 import argparse
 import json
 
+
+def safe_divide(numerator: int, denominator: int) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
 def comparison(path: Path) -> None:
     file_path = Path(path)
-    file = file_path.open("r", encoding="utf-8")
-    data = json.load(file)
-    groundtruth_count = 0
-    test_count = 0
-    intersection_count = 0
-    only_in_groundtruth_count = 0
-    only_in_test_count = 0
+
+    with file_path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    true_positives = 0
+    false_positives = 0
+    false_negatives = 0
+
     for k in data.keys():
-        groundtruth_count += data[k]['groundtruth_count']
-        test_count += data[k]['test_count']
-        intersection_count += data[k]['intersection_count']
-        only_in_groundtruth_count += len(data[k]['only_in_groundtruth'])
-        only_in_test_count += len(data[k]['only_in_test'])
+        true_positives += data[k]["intersection_count"]
+        false_negatives += len(data[k]["only_in_groundtruth"])
+        false_positives += len(data[k]["only_in_test"])
+
+    precision = safe_divide(true_positives, true_positives + false_positives)
+    recall = safe_divide(true_positives, true_positives + false_negatives)
+    f1_score = safe_divide(2 * precision * recall, precision + recall)
+
     print(f"File: {file_path}")
-    print(f"Indicators in groundtruth: {groundtruth_count}")
-    print(f"Indicators in testing: {test_count}")
-    print(f"Intersection of indicators: {intersection_count}")
-    print(f"Indicators only in groundtruth: {only_in_groundtruth_count}")
-    print(f"Indicators only in test: {only_in_test_count}")
+    print(f"True positives: {true_positives}")
+    print(f"False positives: {false_positives}")
+    print(f"False negatives: {false_negatives}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1-score: {f1_score:.4f}")
+
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Generate reports from IoC comparison jsons",
+        description="Generate reports from IoC comparison JSONs",
         epilog=(
             "Example: python generate_comparison_report.py "
             "--file comparison.json"
         ),
     )
-    parser.add_argument("--file", required=True, type=Path, help="Path to the comparison JSON file")
+    parser.add_argument(
+        "--file",
+        required=True,
+        type=Path,
+        help="Path to the comparison JSON file",
+    )
     return parser.parse_args()
 
-def main():
+
+def main() -> None:
     args = parse_args()
-    print(comparison(args.file))
+    comparison(args.file)
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
