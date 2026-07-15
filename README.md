@@ -100,6 +100,8 @@ If a source `log_id`-like column exists, it is preserved as metadata only.
 
 ## Example Commands
 
+Running LR training:
+
 ```bash
 conda run -n LR python -m federated_lr_pipeline.run \
   --org-data examples/orgA_logs.csv examples/orgB_logs.csv examples/orgC_logs.csv \
@@ -149,7 +151,7 @@ Testing mode loads saved specialist weights, global PRF-tag vocabularies, per-or
 
 ## Output Files
 
-Steps 1-5 write:
+LR training outputs:
 
 - `run_config.json`
 - `hierarchical_config.json`
@@ -183,15 +185,8 @@ Testing mode writes only testing outputs:
 - `testing_high_risk_logs.jsonl`
 - `testing_explanations.jsonl`
 
-Step 6 writes:
+IoC-generation writes:
 
 - `ioc_bundle.json`
 - `ioc_records.jsonl`
 - `ioc_summary.csv`
-
-## Limitations
-
-- HMAC-SHA256 PRF tags are used for prototype vocabulary alignment.
-- Local IDF values are organization-specific.
-- Reported round-level accuracy is held-out test accuracy from per-organization stratified splits.
-- The implementation is designed for small research datasets and uses dense NumPy feature matrices.
