@@ -100,8 +100,6 @@ If a source `log_id`-like column exists, it is preserved as metadata only.
 
 ## Example Commands
 
-Run steps 1-5:
-
 ```bash
 conda run -n LR python -m federated_lr_pipeline.run \
   --org-data examples/orgA_logs.csv examples/orgB_logs.csv examples/orgC_logs.csv \
