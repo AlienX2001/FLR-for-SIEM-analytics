@@ -1,0 +1,7 @@
+Host:fin-laptop-01; user:alice; process:EXCEL.exe; parent_process:explorer.exe; command_line:C:\Program Files\Microsoft Office\EXCEL.EXE
+Host:fin-laptop-01; user:alice; process:msedge.exe; parent_process:explorer.exe; source_ip:10.20.10.21; destination_ip:20.190.128.10; domain:login.microsoftonline.com; destination_port:443; protocol:tcp; direction:outbound
+Host:fin-laptop-01; user:alice; source_ip:10.20.10.21; destination_ip:10.20.40.10; destination_port:53; protocol:udp; direction:outbound
+Host:fin-laptop-01; user:alice; process:powershell.exe; parent_process:word.exe; command_line:powershell.exe -enc SQBFAFgA...
+Host:fin-laptop-01; user:alice; process:powershell.exe; parent_process:word.exe; source_ip:10.20.10.21; destination_ip:185.199.110.153; domain:login-ms365-support.com; destination_port:443; protocol:tcp; direction:outbound
+Host:fin-laptop-01; user:alice; process:EXCEL.exe; parent_process:explorer.exe; command_line:C:\Program Files\Microsoft Office\EXCEL.EXE
+Host:fin-laptop-01; user:bob; process:OUTLOOK.exe; parent_process:explorer.exe; command_line:C:\Program Files\Microsoft Office\OUTLOOK.EXE
