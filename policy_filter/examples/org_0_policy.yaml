@@ -31,62 +31,62 @@ category_aliases:
   network: [network, firewall, dns, proxy, flow]
 
 system_policies:
-  - policy_id: finance_workstation_users
+  - policy_id: finance_employee_workstation
     enabled: true
-    valid_from: null
-    valid_until: null
-    hosts: [FIN-LAPTOP-01, FIN-LAPTOP-02]
-    local_ips: [10.20.10.21, 10.20.10.22]
+    hosts:
+      - FIN-LAPTOP-01
+    local_ips:
+      - 10.20.10.21
     authorized_identities:
-      - identity_id: finance_employee_policy
-        users: [alice, bob]
-        groups: [finance-users]
+      - identity_id: alice_workstation_access
+        users:
+          - alice
         authorized_time_windows:
-          - days: [Monday, Tuesday, Wednesday, Thursday, Friday]
-            start: "07:00"
-            end: "19:00"
-            timezone: America/New_York
+          - days:
+              - Monday
+              - Tuesday
+              - Wednesday
+              - Thursday
+              - Friday
+            start: "08:00"
+            end: "18:00"
+            timezone: UTC
         allowed_programs:
-          - name: excel.exe
-            paths:
-              - "C:\\Program Files\\Microsoft Office\\root\\Office16\\EXCEL.EXE"
-            allowed_parent_programs: [explorer.exe]
-          - name: powershell.exe
-            paths:
-              - "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
-            allowed_parent_programs: [explorer.exe, cmd.exe]
-            command_line:
-              allowed_patterns:
-                - "^powershell\\.exe -File C:\\\\ApprovedScripts\\\\[^\\r\\n]+\\.ps1$"
-              prohibited_patterns: []
+          - name: EXCEL.EXE
+          - name: OUTLOOK.EXE
+          - name: msedge.exe
 
 network_policies:
   - policy_id: finance_workstation_network
     enabled: true
-    valid_from: null
-    valid_until: null
-    local_hosts: [FIN-LAPTOP-01, FIN-LAPTOP-02]
-    local_ips: [10.20.10.21, 10.20.10.22]
-    local_networks: [10.20.10.0/24]
+    local_hosts:
+      - FIN-LAPTOP-01
+    local_ips:
+      - 10.20.10.21
     authorized_connections:
-      - connection_id: corporate_dns
+      - connection_id: internal_dns
         direction: outbound
-        remote_ips: [10.20.40.10, 10.20.40.11]
-        remote_cidrs: []
-        remote_domains: []
-        protocols: [udp, tcp]
-        destination_ports: [53]
-      - connection_id: approved_microsoft_services
+        remote_ips:
+          - 10.20.40.10
+        protocols:
+          - udp
+          - tcp
+        destination_ports:
+          - 53
+      - connection_id: microsoft_365
         direction: outbound
-        remote_ips: []
-        remote_cidrs: []
         remote_domains:
           - login.microsoftonline.com
           - "*.office.com"
-        protocols: [tcp]
-        destination_ports: [443]
-        authorized_time_windows:
-          - days: [Monday, Tuesday, Wednesday, Thursday, Friday]
-            start: "00:00"
-            end: "23:59"
-            timezone: America/New_York
+        protocols:
+          - tcp
+        destination_ports:
+          - 443
+      - connection_id: finance_database
+        direction: outbound
+        remote_ips:
+          - 10.20.30.15
+        protocols:
+          - tcp
+        destination_ports:
+          - 5432
