@@ -13,13 +13,14 @@ dependencies = [
   "scikit-learn>=1.2",
   "scipy>=1.10",
   "tqdm>=4.64",
+  "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
-include = ["federated_lr_pipeline*", "ioc_generation*"]
+include = ["federated_lr_pipeline*", "ioc_generation*", "policy_filter*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

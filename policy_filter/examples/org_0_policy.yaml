@@ -1,0 +1,92 @@
+version: 1
+organization_id: org_0
+default_timezone: UTC
+
+preprocessing:
+  text_column: null
+  include_cross_category: true
+  preserve_empty_fields: false
+
+field_mappings:
+  category: [event_category, category, log_type]
+  timestamp: [timestamp, event_time, datetime, time]
+  host: [hostname, host, computer_name, device_id]
+  local_ip: [local_ip]
+  user: [user, username, account_name]
+  user_groups: [groups, user_groups, group_names]
+  program: [process_name, process, executable, image]
+  program_path: [process_path, executable_path, image_path]
+  parent_program: [parent_process, parent_image]
+  command_line: [command_line, process_command_line, cmdline]
+  source_ip: [src_ip, source_ip]
+  destination_ip: [dst_ip, destination_ip, remote_ip]
+  domain: [domain, destination_domain, query, hostname_query]
+  protocol: [protocol, transport_protocol]
+  source_port: [src_port, source_port]
+  destination_port: [dst_port, destination_port, remote_port]
+  direction: [direction, traffic_direction]
+
+category_aliases:
+  system: [system, endpoint, process, authentication, windows, linux]
+  network: [network, firewall, dns, proxy, flow]
+
+system_policies:
+  - policy_id: finance_workstation_users
+    enabled: true
+    valid_from: null
+    valid_until: null
+    hosts: [FIN-LAPTOP-01, FIN-LAPTOP-02]
+    local_ips: [10.20.10.21, 10.20.10.22]
+    authorized_identities:
+      - identity_id: finance_employee_policy
+        users: [alice, bob]
+        groups: [finance-users]
+        authorized_time_windows:
+          - days: [Monday, Tuesday, Wednesday, Thursday, Friday]
+            start: "07:00"
+            end: "19:00"
+            timezone: America/New_York
+        allowed_programs:
+          - name: excel.exe
+            paths:
+              - "C:\\Program Files\\Microsoft Office\\root\\Office16\\EXCEL.EXE"
+            allowed_parent_programs: [explorer.exe]
+          - name: powershell.exe
+            paths:
+              - "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+            allowed_parent_programs: [explorer.exe, cmd.exe]
+            command_line:
+              allowed_patterns:
+                - "^powershell\\.exe -File C:\\\\ApprovedScripts\\\\[^\\r\\n]+\\.ps1$"
+              prohibited_patterns: []
+
+network_policies:
+  - policy_id: finance_workstation_network
+    enabled: true
+    valid_from: null
+    valid_until: null
+    local_hosts: [FIN-LAPTOP-01, FIN-LAPTOP-02]
+    local_ips: [10.20.10.21, 10.20.10.22]
+    local_networks: [10.20.10.0/24]
+    authorized_connections:
+      - connection_id: corporate_dns
+        direction: outbound
+        remote_ips: [10.20.40.10, 10.20.40.11]
+        remote_cidrs: []
+        remote_domains: []
+        protocols: [udp, tcp]
+        destination_ports: [53]
+      - connection_id: approved_microsoft_services
+        direction: outbound
+        remote_ips: []
+        remote_cidrs: []
+        remote_domains:
+          - login.microsoftonline.com
+          - "*.office.com"
+        protocols: [tcp]
+        destination_ports: [443]
+        authorized_time_windows:
+          - days: [Monday, Tuesday, Wednesday, Thursday, Friday]
+            start: "00:00"
+            end: "23:59"
+            timezone: America/New_York
