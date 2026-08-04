@@ -30,6 +30,30 @@ category_aliases:
   system: [system, endpoint, process, authentication, windows, linux]
   network: [network, firewall, dns, proxy, flow]
 
+prefilters:
+  event_id:
+    suppress_ids:
+      - 1000
+      - 1001
+      - "4624"
+    always_forward_ids:
+      - 1102
+      - "4688"
+    require_policy_match_for_suppression: true
+  severity:
+    suppress_values:
+      - debug
+      - informational
+      - info
+      - notice
+    always_forward_values:
+      - warning
+      - error
+      - critical
+      - high
+    case_insensitive: true
+    require_policy_match_for_suppression: true
+
 system_policies:
   - policy_id: finance_employee_workstation
     enabled: true

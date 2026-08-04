@@ -49,10 +49,17 @@ def _parse_ip(value: str | None) -> ipaddress.IPv4Address | ipaddress.IPv6Addres
 def _parse_port(value: str | None) -> int | None:
     if not value:
         return None
+    text = str(value).strip()
     try:
-        port = int(value)
+        port = int(text)
     except ValueError:
-        return None
+        try:
+            numeric = float(text)
+        except ValueError:
+            return None
+        if not numeric.is_integer():
+            return None
+        port = int(numeric)
     return port if 0 <= port <= 65535 else None
 
 

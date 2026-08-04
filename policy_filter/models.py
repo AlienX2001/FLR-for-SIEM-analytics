@@ -65,6 +65,20 @@ class FilterDecision:
 
 
 @dataclass(frozen=True)
+class PrefilterDecision:
+    must_forward: bool
+    suppress_candidate: bool
+    reason_codes: tuple[str, ...]
+    reason_details: tuple[str, ...]
+    normalized_value: str | None = None
+    require_policy_match_for_suppression: bool = True
+
+    @property
+    def is_neutral(self) -> bool:
+        return not self.must_forward and not self.suppress_candidate
+
+
+@dataclass(frozen=True)
 class MatchResult:
     state: MatchState
     reason_code: str
@@ -149,6 +163,27 @@ class NetworkPolicy:
 
 
 @dataclass(frozen=True)
+class EventIdPrefilterPolicy:
+    suppress_ids: frozenset[str] = frozenset()
+    always_forward_ids: frozenset[str] = frozenset()
+    require_policy_match_for_suppression: bool = True
+
+
+@dataclass(frozen=True)
+class SeverityPrefilterPolicy:
+    suppress_values: frozenset[str] = frozenset()
+    always_forward_values: frozenset[str] = frozenset()
+    case_insensitive: bool = True
+    require_policy_match_for_suppression: bool = True
+
+
+@dataclass(frozen=True)
+class PrefilterPolicy:
+    event_id: EventIdPrefilterPolicy | None = None
+    severity: SeverityPrefilterPolicy | None = None
+
+
+@dataclass(frozen=True)
 class PolicyDocument:
     version: int
     organization_id: str
@@ -158,4 +193,30 @@ class PolicyDocument:
     category_aliases: Mapping[str, tuple[str, ...]]
     system_policies: tuple[SystemPolicy, ...]
     network_policies: tuple[NetworkPolicy, ...]
+    prefilters: PrefilterPolicy
     raw: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class TimestampParseResult:
+    timestamp: datetime | None
+    reason_code: str | None = None
+    reason_details: str | None = None
+
+
+@dataclass(frozen=True)
+class AggregateOutputRecord:
+    source_file: Path
+    source_row_number_first: int
+    source_row_number_last: int
+    source_line_number_first: int
+    source_line_number_last: int
+    source_row_numbers: str
+    source_line_numbers: str
+    decision: FilterDecision
+    occurrence_count: int
+    first_seen: str
+    last_seen: str
+    aggregation_window_minutes: int
+    aggregation_status: str
+    row: Mapping[str, str]

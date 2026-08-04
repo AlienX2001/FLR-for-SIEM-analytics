@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from policy_filter import reasons
-from policy_filter.models import CsvLogRecord, FilterDecision
+from policy_filter.models import AggregateOutputRecord, CsvLogRecord, FilterDecision
 
 METADATA_COLUMNS = [
     "source_file",
@@ -20,6 +20,25 @@ METADATA_COLUMNS = [
     "filter_reason_details",
     "evaluated_category",
     "matched_policy_id",
+]
+AGGREGATED_METADATA_COLUMNS = [
+    "source_file",
+    "source_row_number_first",
+    "source_row_number_last",
+    "source_line_number_first",
+    "source_line_number_last",
+    "source_row_numbers",
+    "source_line_numbers",
+    "filter_action",
+    "filter_reason",
+    "filter_reason_details",
+    "evaluated_category",
+    "matched_policy_id",
+    "occurrence_count",
+    "first_seen",
+    "last_seen",
+    "aggregation_window_minutes",
+    "aggregation_status",
 ]
 
 
@@ -109,11 +128,13 @@ class ForwardedCsvWriter:
         *,
         delimiter: str = ",",
         encoding: str = "utf-8",
+        aggregation_enabled: bool = False,
     ) -> None:
         self.output_path = Path(output_path)
         self.original_columns = original_columns
         self.delimiter = delimiter
         self.encoding = encoding
+        self.aggregation_enabled = aggregation_enabled
         self._temp_name: str | None = None
         self._handle = None
         self._writer: csv.DictWriter[str] | None = None
@@ -130,7 +151,10 @@ class ForwardedCsvWriter:
         self._handle = os.fdopen(fd, "w", encoding=self.encoding, newline="")
         self._writer = csv.DictWriter(
             self._handle,
-            fieldnames=METADATA_COLUMNS + self.original_columns,
+            fieldnames=(
+                AGGREGATED_METADATA_COLUMNS if self.aggregation_enabled else METADATA_COLUMNS
+            )
+            + self.original_columns,
             delimiter=self.delimiter,
             extrasaction="ignore",
         )
@@ -152,6 +176,32 @@ class ForwardedCsvWriter:
         }
         for column in self.original_columns:
             row[column] = record.row.get(column, "")
+        self._writer.writerow(row)
+
+    def write_aggregate(self, output: AggregateOutputRecord) -> None:
+        if self._writer is None:
+            raise RuntimeError("writer is not open")
+        row = {
+            "source_file": _metadata_safe(str(output.source_file)),
+            "source_row_number_first": _metadata_safe(output.source_row_number_first),
+            "source_row_number_last": _metadata_safe(output.source_row_number_last),
+            "source_line_number_first": _metadata_safe(output.source_line_number_first),
+            "source_line_number_last": _metadata_safe(output.source_line_number_last),
+            "source_row_numbers": _metadata_safe(output.source_row_numbers),
+            "source_line_numbers": _metadata_safe(output.source_line_numbers),
+            "filter_action": "forward",
+            "filter_reason": _metadata_safe(output.decision.reason_code),
+            "filter_reason_details": _metadata_safe(output.decision.reason_details),
+            "evaluated_category": _metadata_safe(output.decision.category),
+            "matched_policy_id": _metadata_safe(output.decision.matched_policy_id or ""),
+            "occurrence_count": _metadata_safe(output.occurrence_count),
+            "first_seen": _metadata_safe(output.first_seen),
+            "last_seen": _metadata_safe(output.last_seen),
+            "aggregation_window_minutes": _metadata_safe(output.aggregation_window_minutes),
+            "aggregation_status": _metadata_safe(output.aggregation_status),
+        }
+        for column in self.original_columns:
+            row[column] = output.row.get(column, "")
         self._writer.writerow(row)
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -176,15 +226,50 @@ def malformed_decision(details: str | None) -> FilterDecision:
     )
 
 
-def summarize(total: int, suppressed: int, forwarded: int, reasons_by_code: Counter[str]) -> str:
+def summarize(
+    total: int,
+    suppressed: int,
+    forwarded: int,
+    reasons_by_code: Counter[str],
+    *,
+    output_rows_after_aggregation: int | None = None,
+    aggregate_groups: int = 0,
+    max_occurrence_count: int = 0,
+    event_id_counts: Counter[str] | None = None,
+    severity_counts: Counter[str] | None = None,
+    timestamp_parse_failures: int = 0,
+    timestamp_conflicts: int = 0,
+    out_of_order_timestamps: int = 0,
+) -> str:
+    output_rows = forwarded if output_rows_after_aggregation is None else output_rows_after_aggregation
     percentage = (100.0 * forwarded / total) if total else 0.0
+    duplicate_rows_collapsed = max(0, forwarded - output_rows)
     lines = [
         f"total rows read: {total}",
         f"total rows suppressed: {suppressed}",
-        f"total rows forwarded: {forwarded}",
+        f"total rows forwarded before aggregation: {forwarded}",
+        f"total output rows after aggregation: {output_rows}",
+        f"duplicate rows collapsed: {duplicate_rows_collapsed}",
+        f"number of aggregate groups: {aggregate_groups}",
+        f"maximum occurrence count: {max_occurrence_count}",
         f"forwarding percentage: {percentage:.2f}%",
         "filter_reason counts:",
     ]
     for reason_code, count in sorted(reasons_by_code.items()):
         lines.append(f"  {reason_code}: {count}")
+    if event_id_counts is not None:
+        lines.append("Event-ID filter counts:")
+        for reason_code, count in sorted(event_id_counts.items()):
+            lines.append(f"  {reason_code}: {count}")
+    if severity_counts is not None:
+        lines.append("severity filter counts:")
+        for reason_code, count in sorted(severity_counts.items()):
+            lines.append(f"  {reason_code}: {count}")
+    lines.extend(
+        [
+            f"timestamp parse failures: {timestamp_parse_failures}",
+            f"timestamp conflicts: {timestamp_conflicts}",
+            f"out-of-order timestamps: {out_of_order_timestamps}",
+        ]
+    )
     return "\n".join(lines)

@@ -16,11 +16,19 @@ from policy_filter.models import (
     AuthorizedConnection,
     AuthorizedIdentity,
     CommandLinePolicy,
+    EventIdPrefilterPolicy,
     NetworkPolicy,
     PolicyDocument,
     PortMatcher,
+    PrefilterPolicy,
+    SeverityPrefilterPolicy,
     SystemPolicy,
     TimeWindow,
+)
+from policy_filter.prefilters import (
+    PrefilterValueError,
+    canonical_event_id,
+    canonical_severity_value,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -40,6 +48,19 @@ TOP_LEVEL_FIELDS = {
     "category_aliases",
     "system_policies",
     "network_policies",
+    "prefilters",
+}
+PREFILTER_FIELDS = {"event_id", "severity"}
+EVENT_ID_PREFILTER_FIELDS = {
+    "suppress_ids",
+    "always_forward_ids",
+    "require_policy_match_for_suppression",
+}
+SEVERITY_PREFILTER_FIELDS = {
+    "suppress_values",
+    "always_forward_values",
+    "case_insensitive",
+    "require_policy_match_for_suppression",
 }
 SYSTEM_POLICY_FIELDS = {
     "policy_id",
@@ -98,6 +119,26 @@ WEEKDAY_TO_INDEX = {
 
 class PolicyValidationError(ValueError):
     pass
+
+
+class _NoDuplicateSafeLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_mapping_without_duplicate_keys(loader: yaml.Loader, node: yaml.Node, deep: bool = False) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise PolicyValidationError(f"{key_node.start_mark}: duplicate YAML key {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_NoDuplicateSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping_without_duplicate_keys,
+)
 
 
 def _fail(path: str, message: str) -> PolicyValidationError:
@@ -162,6 +203,14 @@ def _str_tuple(value: Any, path: str) -> tuple[str, ...]:
         else:
             raise _fail(f"{path}[{index}]", "empty string is not allowed")
     return tuple(result)
+
+
+def _parse_bool(value: Any, path: str, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise _fail(path, f"must be a boolean, got {type(value).__name__}")
 
 
 def _parse_ip(value: Any, path: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -401,7 +450,7 @@ def _parse_system_policy(
     policy_id = str(mapping.get("policy_id") or "").strip()
     if not policy_id:
         raise _fail(f"{path}.policy_id", "policy_id is required")
-    enabled = bool(mapping.get("enabled", True))
+    enabled = _parse_bool(mapping.get("enabled"), f"{path}.enabled", default=True)
     hosts = _str_tuple(mapping.get("hosts"), f"{path}.hosts")
     local_ips = tuple(
         _parse_ip(item, f"{path}.local_ips[{item_index}]")
@@ -529,7 +578,7 @@ def _parse_network_policy(
     policy_id = str(mapping.get("policy_id") or "").strip()
     if not policy_id:
         raise _fail(f"{path}.policy_id", "policy_id is required")
-    enabled = bool(mapping.get("enabled", True))
+    enabled = _parse_bool(mapping.get("enabled"), f"{path}.enabled", default=True)
     local_hosts = _str_tuple(mapping.get("local_hosts"), f"{path}.local_hosts")
     local_ips = tuple(
         _parse_ip(item, f"{path}.local_ips[{item_index}]")
@@ -573,13 +622,157 @@ def _parse_network_policy(
     )
 
 
+def _event_id_set(value: Any, path: str) -> frozenset[str]:
+    normalized: set[str] = set()
+    for index, item in enumerate(_as_list(value, path)):
+        try:
+            normalized.add(canonical_event_id(item))
+        except PrefilterValueError as exc:
+            raise _fail(f"{path}[{index}]", str(exc)) from exc
+    return frozenset(normalized)
+
+
+def _severity_set(value: Any, path: str, *, case_insensitive: bool) -> frozenset[str]:
+    normalized: set[str] = set()
+    for index, item in enumerate(_as_list(value, path)):
+        try:
+            normalized.add(
+                canonical_severity_value(
+                    item,
+                    case_insensitive=case_insensitive,
+                )
+            )
+        except PrefilterValueError as exc:
+            raise _fail(f"{path}[{index}]", str(exc)) from exc
+    return frozenset(normalized)
+
+
+def _parse_event_id_prefilter(
+    value: Any,
+    *,
+    strict: bool,
+    errors: list[str],
+) -> EventIdPrefilterPolicy:
+    path = "prefilters.event_id"
+    mapping = _as_dict(value, path)
+    _check_unknown_fields(
+        mapping,
+        EVENT_ID_PREFILTER_FIELDS,
+        strict=strict,
+        path=path,
+        errors=errors,
+    )
+    suppress_ids = _event_id_set(mapping.get("suppress_ids"), f"{path}.suppress_ids")
+    always_forward_ids = _event_id_set(
+        mapping.get("always_forward_ids"),
+        f"{path}.always_forward_ids",
+    )
+    if not suppress_ids and not always_forward_ids:
+        raise _fail(path, "event_id prefilter must define suppress_ids or always_forward_ids")
+    overlap = sorted(suppress_ids & always_forward_ids)
+    if overlap:
+        raise _fail(path, f"Event IDs cannot be both suppressed and always-forwarded: {overlap}")
+    return EventIdPrefilterPolicy(
+        suppress_ids=suppress_ids,
+        always_forward_ids=always_forward_ids,
+        require_policy_match_for_suppression=_parse_bool(
+            mapping.get("require_policy_match_for_suppression"),
+            f"{path}.require_policy_match_for_suppression",
+            default=True,
+        ),
+    )
+
+
+def _parse_severity_prefilter(
+    value: Any,
+    *,
+    strict: bool,
+    errors: list[str],
+) -> SeverityPrefilterPolicy:
+    path = "prefilters.severity"
+    mapping = _as_dict(value, path)
+    _check_unknown_fields(
+        mapping,
+        SEVERITY_PREFILTER_FIELDS,
+        strict=strict,
+        path=path,
+        errors=errors,
+    )
+    case_insensitive = _parse_bool(
+        mapping.get("case_insensitive"),
+        f"{path}.case_insensitive",
+        default=True,
+    )
+    suppress_values = _severity_set(
+        mapping.get("suppress_values"),
+        f"{path}.suppress_values",
+        case_insensitive=case_insensitive,
+    )
+    always_forward_values = _severity_set(
+        mapping.get("always_forward_values"),
+        f"{path}.always_forward_values",
+        case_insensitive=case_insensitive,
+    )
+    if not suppress_values and not always_forward_values:
+        raise _fail(path, "severity prefilter must define suppress_values or always_forward_values")
+    overlap = sorted(suppress_values & always_forward_values)
+    if overlap:
+        raise _fail(path, f"severity values cannot be both suppressed and always-forwarded: {overlap}")
+    return SeverityPrefilterPolicy(
+        suppress_values=suppress_values,
+        always_forward_values=always_forward_values,
+        case_insensitive=case_insensitive,
+        require_policy_match_for_suppression=_parse_bool(
+            mapping.get("require_policy_match_for_suppression"),
+            f"{path}.require_policy_match_for_suppression",
+            default=True,
+        ),
+    )
+
+
+def _parse_prefilters(
+    value: Any,
+    *,
+    strict: bool,
+    errors: list[str],
+) -> PrefilterPolicy:
+    mapping = _as_dict(value, "prefilters")
+    _check_unknown_fields(
+        mapping,
+        PREFILTER_FIELDS,
+        strict=strict,
+        path="prefilters",
+        errors=errors,
+    )
+    return PrefilterPolicy(
+        event_id=(
+            _parse_event_id_prefilter(
+                mapping["event_id"],
+                strict=strict,
+                errors=errors,
+            )
+            if "event_id" in mapping
+            else None
+        ),
+        severity=(
+            _parse_severity_prefilter(
+                mapping["severity"],
+                strict=strict,
+                errors=errors,
+            )
+            if "severity" in mapping
+            else None
+        ),
+    )
+
+
 def _load_raw_policy(path: Path) -> dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as handle:
             if path.suffix.lower() == ".json":
                 payload = json.load(handle)
             else:
-                payload = yaml.safe_load(handle)
+                payload = yaml.load(handle, Loader=_NoDuplicateSafeLoader)
     except OSError:
         raise
     except Exception as exc:
@@ -636,6 +829,11 @@ def load_policy(path: str | Path, *, strict: bool = False) -> PolicyDocument:
         )
         for index, item in enumerate(_as_list(raw.get("network_policies"), "network_policies"))
     )
+    prefilters = _parse_prefilters(
+        raw.get("prefilters"),
+        strict=strict,
+        errors=errors,
+    )
     policy_ids = [policy.policy_id for policy in system_policies + network_policies]
     duplicates = sorted({item for item in policy_ids if policy_ids.count(item) > 1})
     if duplicates:
@@ -651,5 +849,6 @@ def load_policy(path: str | Path, *, strict: bool = False) -> PolicyDocument:
         category_aliases=category_aliases,
         system_policies=system_policies,
         network_policies=network_policies,
+        prefilters=prefilters,
         raw=raw,
     )

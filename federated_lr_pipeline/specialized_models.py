@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import ipaddress
 import json
 import logging
+import math
 import re
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +44,23 @@ from federated_lr_pipeline.vocab import (
 LOGGER = logging.getLogger(__name__)
 SUBTOKEN_RE = re.compile(r"[A-Za-z0-9]{2,}")
 FeatureMatrixCache = dict[tuple[str, str, int, str], tuple[tuple[str, ...], sparse.csr_matrix]]
+CROSS_TOKEN_SCOPES = (
+    "same_cloud_identity",
+    "same_service_account",
+    "same_process_tree",
+    "same_network_zone",
+    "same_parent_process",
+    "same_cloud_account",
+    "same_process_pid",
+    "same_container",
+    "same_session",
+    "same_cluster",
+    "same_entity",
+    "same_src_ip",
+    "same_dst_ip",
+    "same_host",
+    "same_user",
+)
 
 
 @dataclass(frozen=True)
@@ -208,6 +227,416 @@ def _numeric_value(row: Mapping[str, Any] | pd.Series, columns: list[str]) -> fl
     return 0.0
 
 
+def _row_columns(row: Mapping[str, Any] | pd.Series) -> list[str]:
+    if isinstance(row, Mapping):
+        return [str(column) for column in row.keys()]
+    return [str(column) for column in row.index]
+
+
+def _row_haystack(
+    row: Mapping[str, Any] | pd.Series,
+    columns: list[str] | None = None,
+) -> str:
+    selected_columns = columns if columns is not None else _row_columns(row)
+    return " ".join(
+        str(_row_get(row, column)).lower()
+        for column in selected_columns
+        if _row_has(row, column) and not _is_missing_value(_row_get(row, column))
+    )
+
+
+def _value_contains_anywhere(row: Mapping[str, Any] | pd.Series, needles: list[str]) -> bool:
+    haystack = _row_haystack(row)
+    return any(needle in haystack for needle in needles)
+
+
+def _any_present(row: Mapping[str, Any] | pd.Series, columns: list[str]) -> bool:
+    return any(
+        _row_has(row, column) and not _is_missing_value(_row_get(row, column))
+        for column in columns
+    )
+
+
+def _numeric_max(row: Mapping[str, Any] | pd.Series, columns: list[str]) -> float:
+    values: list[float] = []
+    for column in columns:
+        if not _row_has(row, column) or _is_missing_value(_row_get(row, column)):
+            continue
+        value = pd.to_numeric(_row_get(row, column), errors="coerce")
+        if not pd.isna(value):
+            values.append(float(value))
+    return max(values) if values else 0.0
+
+
+def _port_matches(row: Mapping[str, Any] | pd.Series, ports: set[int]) -> bool:
+    for column in ["dst_port", "destination_port", "remote_port", "local_port", "src_port"]:
+        if not _row_has(row, column) or _is_missing_value(_row_get(row, column)):
+            continue
+        value = pd.to_numeric(_row_get(row, column), errors="coerce")
+        if not pd.isna(value) and int(value) in ports:
+            return True
+    return False
+
+
+def _is_outbound(row: Mapping[str, Any] | pd.Series) -> bool:
+    return _value_contains(
+        row,
+        ["network_direction", "direction", "traffic_direction"],
+        ["outbound", "egress", "out"],
+    )
+
+
+def _ip_value(value: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if _is_missing_value(value):
+        return None
+    try:
+        return ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _has_external_ip(row: Mapping[str, Any] | pd.Series, columns: list[str]) -> bool:
+    for column in columns:
+        if not _row_has(row, column):
+            continue
+        ip_value = _ip_value(_row_get(row, column))
+        if ip_value is None:
+            continue
+        if not (
+            ip_value.is_loopback
+            or ip_value.is_link_local
+            or ip_value.is_private
+            or ip_value.is_multicast
+            or ip_value.is_unspecified
+        ):
+            return True
+    return False
+
+
+def _domain_values(row: Mapping[str, Any] | pd.Series) -> list[str]:
+    values = []
+    for column in ["domain", "dns_query", "query", "http_host", "tls_sni", "hostname_query"]:
+        if _row_has(row, column) and not _is_missing_value(_row_get(row, column)):
+            values.append(str(_row_get(row, column)).strip().lower().rstrip("."))
+    return values
+
+
+def _domain_entropy(domain: str) -> float:
+    compact = re.sub(r"[^a-z0-9]", "", domain.lower())
+    if not compact:
+        return 0.0
+    counts = Counter(compact)
+    total = len(compact)
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def _has_high_entropy_domain(row: Mapping[str, Any] | pd.Series) -> bool:
+    for domain in _domain_values(row):
+        labels = [label for label in domain.split(".") if label]
+        longest = max((len(label) for label in labels), default=0)
+        digit_count = sum(character.isdigit() for character in domain)
+        if longest >= 18 and _domain_entropy(domain) >= 3.3:
+            return True
+        if digit_count >= 6 and _domain_entropy(domain) >= 3.0:
+            return True
+    return False
+
+
+def _has_external_target(row: Mapping[str, Any] | pd.Series) -> bool:
+    return (
+        _any_present(row, ["remote_address", "http_host", "tls_sni", "domain", "dns_query"])
+        or _has_external_ip(row, ["dst_ip", "destination_ip", "remote_ip", "remote_address"])
+    )
+
+
+def _has_successful_login(row: Mapping[str, Any] | pd.Series) -> bool:
+    return (
+        _value_contains(
+            row,
+            ["sub_label", "sub_label_cat", "login_result", "auth_result", "event_name", "label"],
+            ["successful_login", "success", "accepted", "login_success"],
+        )
+        or _value_contains(row, ["EventID", "eventid", "event_id"], ["4624"])
+    )
+
+
+def _cross_signal_detectors() -> dict[str, Callable[[Mapping[str, Any] | pd.Series], bool]]:
+    def encoded_command(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _value_contains(
+            row,
+            ["process_command_line", "process_name", "process_exe", "command_line", "cmdline"],
+            ["encodedcommand", " -enc ", "-encodedcommand", "frombase64string", "powershell", "cmd.exe"],
+        )
+
+    def sensitive_file_read(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _value_contains(
+            row,
+            [
+                "file_path",
+                "process_command_line",
+                "process_exe",
+                "llm_tool_input",
+                "tool_input",
+                "EventData.ImagePath",
+            ],
+            ["secret", "password", "credential", "token", "key", "sensitive", "wallet", "cookie"],
+        )
+
+    def llm_file_read_tool(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _value_contains(
+            row,
+            ["llm_tool_name", "llm_tool_input", "tool_name", "tool_input"],
+            ["file_read", "read_file", "secret_read", "open_file", "cat "],
+        )
+
+    def failed_login_burst(row: Mapping[str, Any] | pd.Series) -> bool:
+        return (
+            _value_contains(
+                row,
+                ["sub_label", "sub_label_cat", "process_command_line", "label", "login_result", "event_name"],
+                ["failed_login", "bruteforce", "failed login", "login_failed", "failure", "denied"],
+            )
+            or _numeric_max(row, ["failed_login_count", "auth_failure_count", "failure_count"]) >= 5
+        )
+
+    def large_upload(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _numeric_max(row, ["total_size", "bytes_out", "total_sum", "upload_bytes"]) >= 5000
+
+    def high_beacon_rate(row: Mapping[str, Any] | pd.Series) -> bool:
+        return (
+            _numeric_max(row, ["rate", "srate", "drate", "beacon_rate", "connection_rate"]) >= 10
+            or _value_contains_anywhere(row, ["beacon"])
+        )
+
+    def high_connection_fanout(row: Mapping[str, Any] | pd.Series) -> bool:
+        return (
+            _numeric_max(row, ["fanout", "unique_dst_count", "connection_count", "dst_count"]) >= 20
+            or _value_contains_anywhere(row, ["fanout"])
+        )
+
+    def long_duration_flow(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _numeric_max(row, ["flow_duration", "duration", "duration_ms"]) >= 900
+
+    def internal_port_scan(row: Mapping[str, Any] | pd.Series) -> bool:
+        return (
+            _value_contains_anywhere(row, ["port_scan", "port scan", "scan"])
+            or _numeric_max(row, ["syn_count", "dst_port_count", "packet_number"]) >= 50
+        )
+
+    def dns_tunnel_pattern(row: Mapping[str, Any] | pd.Series) -> bool:
+        domains = _domain_values(row)
+        return (
+            _value_contains_anywhere(row, ["dns_tunnel", "dns tunnel", "iodine", "dnscat"])
+            or any(len(domain) >= 80 or domain.count(".") >= 5 for domain in domains)
+        )
+
+    def dns_txt_query_burst(row: Mapping[str, Any] | pd.Series) -> bool:
+        return (
+            _value_contains_anywhere(row, ["dns_txt", " txt ", "record_type=txt", "type=txt"])
+            or _numeric_max(row, ["dns_txt_count", "txt_query_count"]) >= 5
+        )
+
+    def domain_generation_pattern(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _value_contains_anywhere(row, ["dga", "domain_generation"]) or _has_high_entropy_domain(row)
+
+    def first_seen_domain(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _value_contains_anywhere(row, ["first_seen_domain", "new_domain"]) or bool(_domain_values(row))
+
+    def rare_destination_ip(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _value_contains_anywhere(row, ["rare_destination", "rare_dst", "new_destination"]) or _has_external_ip(
+            row,
+            ["dst_ip", "destination_ip", "remote_ip"],
+        )
+
+    def outbound_ssh(row: Mapping[str, Any] | pd.Series) -> bool:
+        return (_is_outbound(row) or _any_present(row, ["dst_ip", "remote_address"])) and (
+            _port_matches(row, {22}) or _value_contains_anywhere(row, ["ssh"])
+        )
+
+    def outbound_rdp(row: Mapping[str, Any] | pd.Series) -> bool:
+        return (_is_outbound(row) or _any_present(row, ["dst_ip", "remote_address"])) and (
+            _port_matches(row, {3389}) or _value_contains_anywhere(row, ["rdp"])
+        )
+
+    def external_tls_post(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _has_external_target(row) and (
+            _port_matches(row, {443})
+            or _value_contains_anywhere(row, ["tls", "https", "ssl"])
+        ) and _value_contains_anywhere(row, ["post", "upload", "put"])
+
+    def http_post_to_ip(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _has_external_ip(row, ["dst_ip", "destination_ip", "remote_ip"]) and _value_contains_anywhere(
+            row,
+            ["post", "http_method=post", "method=post"],
+        )
+
+    def suspicious_user_agent(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _value_contains(
+            row,
+            ["user_agent", "http_user_agent", "http_headers", "process_command_line"],
+            ["curl", "wget", "python-requests", "go-http-client", "powershell", "bot", "scanner"],
+        )
+
+    def repeated_404_beacon(row: Mapping[str, Any] | pd.Series) -> bool:
+        return (
+            _value_contains_anywhere(row, ["repeated_404", "404_beacon"])
+            or (
+                _value_contains(row, ["status", "status_code", "http_status"], ["404"])
+                and high_beacon_rate(row)
+            )
+        )
+
+    def failed_tls_handshake_burst(row: Mapping[str, Any] | pd.Series) -> bool:
+        return (
+            _value_contains_anywhere(row, ["tls_handshake_failed", "handshake failure", "tls fail"])
+            or _numeric_max(row, ["tls_failure_count", "failed_tls_count"]) >= 3
+        )
+
+    def cleartext_credential_post(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _value_contains_anywhere(row, ["password=", "passwd=", "token=", "api_key=", "cleartext_credential"]) and (
+            _value_contains_anywhere(row, ["post", "http"]) or _port_matches(row, {80, 8080})
+        )
+
+    def smtp_exfil_pattern(row: Mapping[str, Any] | pd.Series) -> bool:
+        return (
+            _port_matches(row, {25, 465, 587})
+            or _value_contains_anywhere(row, ["smtp_exfil", "smtp upload", "mail attachment"])
+        ) and (large_upload(row) or _value_contains_anywhere(row, ["exfil"]))
+
+    def icmp_tunnel_pattern(row: Mapping[str, Any] | pd.Series) -> bool:
+        return (
+            _value_contains(row, ["protocol", "protocol_name", "proto"], ["icmp"])
+            or _value_contains_anywhere(row, ["icmp_tunnel", "icmp tunnel"])
+        ) and (large_upload(row) or _numeric_max(row, ["packet_number", "pkts_out"]) >= 50)
+
+    def smb_lateral_connection(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _port_matches(row, {139, 445}) or _value_contains_anywhere(row, ["smb", "admin$", "c$"])
+
+    def tor_exit_connection(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _value_contains_anywhere(row, ["tor", ".onion"]) or _port_matches(row, {9001, 9030, 9050, 9150})
+
+    def proxy_bypass_connection(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _value_contains_anywhere(row, ["proxy_bypass", "bypass proxy", "direct_connection"])
+
+    def cloud_storage_upload(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _value_contains_anywhere(row, ["s3", "blob", "gcs", "cloud_storage", "storage.googleapis"]) and (
+            large_upload(row) or _value_contains_anywhere(row, ["upload", "put", "post"])
+        )
+
+    def unusual_dst_port(row: Mapping[str, Any] | pd.Series) -> bool:
+        common_ports = {20, 21, 22, 25, 53, 80, 110, 123, 143, 443, 445, 465, 587, 993, 995, 3389}
+        for column in ["dst_port", "destination_port", "remote_port"]:
+            if not _row_has(row, column) or _is_missing_value(_row_get(row, column)):
+                continue
+            value = pd.to_numeric(_row_get(row, column), errors="coerce")
+            if not pd.isna(value) and int(value) not in common_ports:
+                return True
+        return _value_contains_anywhere(row, ["unusual_dst_port", "rare_port"])
+
+    def new_tls_sni(row: Mapping[str, Any] | pd.Series) -> bool:
+        return _value_contains_anywhere(row, ["new_tls_sni", "first_seen_sni"]) or _any_present(row, ["tls_sni", "sni"])
+
+    return {
+        "encoded_command": encoded_command,
+        "sensitive_file_read": sensitive_file_read,
+        "secret_read_tool": lambda row: sensitive_file_read(row)
+        or _value_contains_anywhere(row, ["secret_read", "read_secret"]),
+        "llm_file_read_tool": llm_file_read_tool,
+        "failed_login_burst": failed_login_burst,
+        "large_upload": large_upload,
+        "external_post": lambda row: _has_external_target(row)
+        or _value_contains_anywhere(row, ["external_post", "external post"]),
+        "external_tls_post": external_tls_post,
+        "first_seen_domain": first_seen_domain,
+        "rare_destination_ip": rare_destination_ip,
+        "dns_tunnel_pattern": dns_tunnel_pattern,
+        "high_beacon_rate": high_beacon_rate,
+        "outbound_ssh": outbound_ssh,
+        "outbound_rdp": outbound_rdp,
+        "suspicious_user_agent": suspicious_user_agent,
+        "http_post_to_ip": http_post_to_ip,
+        "domain_generation_pattern": domain_generation_pattern,
+        "tor_exit_connection": tor_exit_connection,
+        "internal_port_scan": internal_port_scan,
+        "smb_lateral_connection": smb_lateral_connection,
+        "dns_txt_query_burst": dns_txt_query_burst,
+        "unusual_country_destination": lambda row: _value_contains_anywhere(
+            row,
+            ["unusual_country", "rare_country", "geo_anomaly"],
+        ),
+        "long_duration_flow": long_duration_flow,
+        "high_connection_fanout": high_connection_fanout,
+        "failed_tls_handshake_burst": failed_tls_handshake_burst,
+        "cleartext_credential_post": cleartext_credential_post,
+        "smtp_exfil_pattern": smtp_exfil_pattern,
+        "icmp_tunnel_pattern": icmp_tunnel_pattern,
+        "proxy_bypass_connection": proxy_bypass_connection,
+        "cloud_storage_upload": cloud_storage_upload,
+        "unusual_dst_port": unusual_dst_port,
+        "new_external_asn": lambda row: _value_contains_anywhere(row, ["new_asn", "new_external_asn"]),
+        "new_geolocation": lambda row: _value_contains_anywhere(row, ["new_geo", "new_geolocation"]),
+        "high_entropy_domain": _has_high_entropy_domain,
+        "repeated_404_beacon": repeated_404_beacon,
+        "rare_ja3_fingerprint": lambda row: _value_contains_anywhere(row, ["rare_ja3", "ja3"])
+        and _any_present(row, ["ja3", "ja3_fingerprint", "tls_ja3"]),
+        "bulk_download": lambda row: _numeric_max(row, ["bytes_in", "download_bytes", "total_size"]) >= 5000
+        or _value_contains_anywhere(row, ["bulk_download"]),
+        "dns_nxdomain_burst": lambda row: _value_contains_anywhere(row, ["nxdomain"])
+        and _numeric_max(row, ["dns_query_count", "nxdomain_count"]) >= 5,
+        "east_west_connection_spike": lambda row: _value_contains_anywhere(row, ["east_west", "lateral"])
+        or _numeric_max(row, ["internal_connection_count", "east_west_count"]) >= 20,
+        "vpn_egress_connection": lambda row: _value_contains_anywhere(row, ["vpn"])
+        and (_is_outbound(row) or _has_external_target(row)),
+        "successful_login": _has_successful_login,
+        "system_sensitive_file_read": sensitive_file_read,
+    }
+
+
+def _scope_supported(row: Mapping[str, Any] | pd.Series, scope: str) -> bool:
+    scope_columns = {
+        "same_host": ["host", "hostname", "Computer", "computer_name", "device_id"],
+        "same_user": ["user_uid", "user_euid", "UserID", "user", "username", "account_name", "principal", "identity"],
+        "same_session": ["session_id", "SessionID", "logon_id"],
+        "same_process_tree": ["process_pid", "process_ppid", "process_tgid", "parent_process", "parent"],
+        "same_cloud_identity": ["cloud_identity", "managed_identity", "principal", "cloud_account"],
+        "same_src_ip": ["src_ip", "source_ip", "local_ip", "local_address"],
+        "same_dst_ip": ["dst_ip", "destination_ip", "remote_ip", "remote_address"],
+        "same_entity": ["entity_id", "source_entity_id", "target_entity_id"],
+        "same_service_account": ["service_account", "ServiceName", "account_name", "cloud_identity"],
+        "same_network_zone": ["network_zone", "network_direction", "src_ip", "dst_ip"],
+        "same_process_pid": ["process_pid", "ProcessID"],
+        "same_parent_process": ["process_ppid", "parent_process", "parent"],
+        "same_container": ["container_id", "container_name", "pod_name"],
+        "same_cluster": ["cluster", "cluster_name", "k8s_cluster"],
+        "same_cloud_account": ["cloud_account", "cloud_provider", "cloud_region"],
+    }
+    return _any_present(row, scope_columns.get(scope, []))
+
+
+def _parse_cross_token(token: str) -> tuple[str, str, str] | None:
+    if not token.startswith("cross:") or not token.endswith("_15m"):
+        return None
+    body = token[len("cross:") : -len("_15m")]
+    for scope in CROSS_TOKEN_SCOPES:
+        suffix = f"_{scope}"
+        if not body.endswith(suffix):
+            continue
+        pair = body[: -len(suffix)]
+        if "_AND_" not in pair:
+            return None
+        left, right = pair.split("_AND_", maxsplit=1)
+        return left, right, scope
+    return None
+
+
+CROSS_SIGNAL_DETECTORS = _cross_signal_detectors()
+CROSS_TOKEN_SPECS = tuple(
+    (token, parsed[0], parsed[1], parsed[2])
+    for token in CROSS_CATEGORY_TOKENS
+    if (parsed := _parse_cross_token(token)) is not None
+)
+
+
 def cross_tokens_for_row(row: Mapping[str, Any] | pd.Series) -> list[str]:
     tokens: list[str] = []
     total_size = _numeric_value(row, ["total_size", "bytes_out", "total_sum"])
@@ -246,6 +675,22 @@ def cross_tokens_for_row(row: Mapping[str, Any] | pd.Series) -> list[str]:
         tokens.append("cross:failed_login_burst_AND_successful_login_same_user_15m")
     if has_sensitive_file and has_external_target:
         tokens.append("cross:secret_read_tool_AND_external_post_same_user_15m")
+
+    active_signals = {
+        signal
+        for signal, detector in CROSS_SIGNAL_DETECTORS.items()
+        if detector(row)
+    }
+    active_scopes = {
+        scope for scope in CROSS_TOKEN_SCOPES if _scope_supported(row, scope)
+    }
+    for token, left_signal, right_signal, scope in CROSS_TOKEN_SPECS:
+        if (
+            left_signal in active_signals
+            and right_signal in active_signals
+            and scope in active_scopes
+        ):
+            tokens.append(token)
     return list(dict.fromkeys(tokens))
 
 

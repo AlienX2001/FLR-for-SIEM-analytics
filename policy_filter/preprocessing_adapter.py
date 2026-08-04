@@ -23,6 +23,24 @@ def _nonempty_text(value: Any) -> str | None:
     return text if text.strip() else None
 
 
+def canonicalize_policy_value(value: Any) -> str:
+    if _is_missing_value(value):
+        return ""
+    return _field_value(value)
+
+
+def normalized_event_fields(
+    raw_row: Mapping[str, str],
+    *,
+    excluded_fields: set[str],
+) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (str(column), canonicalize_policy_value(value))
+        for column, value in sorted(raw_row.items())
+        if column not in excluded_fields
+    )
+
+
 def resolve_fields(
     raw_row: Mapping[str, str],
     field_mappings: Mapping[str, tuple[str, ...]],
