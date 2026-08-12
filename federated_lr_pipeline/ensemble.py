@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from federated_lr_pipeline.model import softmax
+from federated_lr_pipeline.model import observed_bounds, softmax
+
+LOGGER = logging.getLogger(__name__)
 
 
 class EnsembleFusion(ABC):
@@ -107,6 +110,16 @@ class MetaLogitFusion(EnsembleFusion):
 def fused_probabilities(
     fusion: EnsembleFusion,
     logits_by_label: dict[str, dict[str, np.ndarray]],
+    *,
+    log_context: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     label_logits = fusion.predict_logits(logits_by_label)
+    if log_context is not None:
+        lower_bound, upper_bound = observed_bounds(label_logits)
+        LOGGER.info(
+            "%s softmax input bounds: lower=%s upper=%s",
+            log_context,
+            lower_bound,
+            upper_bound,
+        )
     return label_logits, softmax(label_logits)

@@ -1,0 +1,53 @@
+version: 1
+profile_name: endpoint_and_network_benign_profile
+
+fields:
+  entity: [host]
+  categorical:
+    - process_name
+    - protocol_name
+    - network_direction
+    - dst_port
+  numeric:
+    - flow_duration
+    - total_size
+  text:
+    - process_command_line
+    - process_exe
+    - file_path
+  ignored:
+    - event_time_epoch
+    - event_time_iso
+    - label
+    - sub_label
+    - sub_label_cat
+  auto_infer: true
+  auto_ignore_timestamps: true
+
+training:
+  minimum_rows: 100
+  minimum_entity_rows: 20
+  maximum_entities: 1000
+  numeric_inference_ratio: 0.98
+  categorical_minimum_count: 2
+  maximum_categorical_values: 10000
+  token_minimum_count: 2
+  maximum_tokens_per_field: 10000
+
+detection:
+  anomaly_score_threshold: 1.0
+  numeric_standard_deviations: 4.0
+  enforce_observed_numeric_range: true
+  maximum_unseen_token_ratio: 0.25
+  missing_profiled_field_is_anomaly: true
+  unknown_entity_is_anomaly: true
+
+score_weights:
+  unknown_entity: 1.0
+  missing_field: 1.0
+  unknown_categorical_value: 1.0
+  numeric_outlier: 1.0
+  unseen_text_tokens: 1.0
+  malformed_row: 1.0
+  insufficient_evidence: 1.0
+

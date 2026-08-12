@@ -20,7 +20,12 @@ dependencies = [
 dev = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
-include = ["federated_lr_pipeline*", "ioc_generation*", "policy_filter*"]
+include = [
+  "federated_lr_pipeline*",
+  "ioc_generation*",
+  "policy_filter*",
+  "behaviour_profiling*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

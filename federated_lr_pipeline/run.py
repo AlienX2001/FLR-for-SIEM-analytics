@@ -163,6 +163,9 @@ def run_pipeline(config: PipelineConfig) -> None:
     texts_by_subcategory, missing_by_subcategory = build_subcategory_texts(
         org_datasets,
         subcategories=active_subcategories,
+        context_window_minutes=config.context_window_minutes,
+        context_timestamp_epoch_field=config.context_timestamp_epoch_field,
+        context_timestamp_iso_field=config.context_timestamp_iso_field,
     )
     token_counters_by_subcategory = build_subcategory_token_counters(texts_by_subcategory)
 

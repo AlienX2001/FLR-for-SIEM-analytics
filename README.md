@@ -1,5 +1,11 @@
 # Federated Logistic Regression Prototype
 
+The repository also includes two independent pre-analysis components:
+
+- [`policy_filter`](policy_filter/README.md) for explicit allow-list filtering.
+- [`behaviour_profiling`](behaviour_profiling/README.md) for training a benign
+  behavioral baseline and detecting rows outside that baseline.
+
 This project is a research prototype for federated SIEM log classification with PRF-aligned vocabularies and a label-conditioned hierarchical ensemble.
 
 It has two independent code paths:
@@ -81,6 +87,33 @@ Cross-category features use a fixed vocabulary before training. Examples:
 
 These features are generated from primitive signals before training and are PRF-tagged with the same label/subcategory namespace.
 
+Cross features use an organization-local, causal 15-minute event window. Rows are
+processed in stable timestamp order, but generated features remain aligned to the
+original CSV row positions. For each configured scope such as user, host, source
+IP, session, or process tree, the extractor retains primitive signals from the
+current event and preceding 15 minutes. A cross token is emitted on the event that
+completes the configured signal pair. The upper boundary is inclusive.
+
+For example, a failed login at `10:00` followed by a successful login for the same
+user at `10:05` can activate:
+
+```text
+cross:failed_login_burst_AND_successful_login_same_user_15m
+```
+
+The same events for different users do not correlate. Context is never shared
+between organizations. Invalid, missing, or conflicting timestamps fall back to
+single-row cross evidence for that row and never borrow context from another row.
+The extractor is causal and does not inspect events later than the event being
+scored.
+
+The context window is independent of `--batch-size`, which controls local LR
+training updates only. The fixed vocabulary currently supports `15` minutes. Use
+`--context-window-minutes 0` only to retain the legacy row-local extraction mode.
+Timestamp columns default to `event_time_epoch` and `event_time_iso` and can be
+changed with `--context-timestamp-epoch-field` and
+`--context-timestamp-iso-field`.
+
 ## Input CSV Format
 
 Each organization provides:
@@ -114,6 +147,9 @@ conda run -n LR python -m federated_lr_pipeline.run \
   --test-size 0.2 \
   --class-weight balanced \
   --aggregation-weighting sample_size \
+  --context-window-minutes 15 \
+  --context-timestamp-epoch-field event_time_epoch \
+  --context-timestamp-iso-field event_time_iso \
   --output-dir outputs/run_001
 ```
 
@@ -147,7 +183,7 @@ conda run -n LR python -m federated_lr_pipeline.run \
   --output-dir outputs/test_run_001
 ```
 
-Testing mode loads saved specialist weights, global PRF-tag vocabularies, per-organization index vectors, label classes, and fusion metadata. It does not regenerate vocabularies, train local models, aggregate parameters, initialize new models, or write new trained weights. Testing from raw logs requires saved local vocabulary tokens; run the training job with `--debug-plaintext-vocab` when you need later standalone testing from CSV inputs.
+Testing mode loads saved specialist weights, global PRF-tag vocabularies, per-organization index vectors, label classes, fusion metadata, and the training-time cross-context settings. It does not regenerate vocabularies, train local models, aggregate parameters, initialize new models, or write new trained weights. Testing from raw logs requires saved local vocabulary tokens; run the training job with `--debug-plaintext-vocab` when you need later standalone testing from CSV inputs. Artifacts created before `cross_context` metadata was introduced retain legacy row-local cross extraction during testing.
 
 ## Output Files
 

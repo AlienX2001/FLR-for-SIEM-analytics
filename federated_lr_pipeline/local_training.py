@@ -20,6 +20,8 @@ class BinaryTrainingResult:
     num_examples: int
     loss: float
     accuracy: float
+    sigmoid_input_lower_bound: float | None
+    sigmoid_input_upper_bound: float | None
 
 
 def build_feature_matrix(
@@ -178,6 +180,25 @@ def train_binary_logistic_regression(
     n_examples = X.shape[0]
     total_updates = epochs * int(np.ceil(n_examples / batch_size)) if n_examples else 0
     update_counter = 0
+    sigmoid_input_lower_bound: float | None = None
+    sigmoid_input_upper_bound: float | None = None
+
+    def record_sigmoid_input_bounds(logits: np.ndarray) -> None:
+        nonlocal sigmoid_input_lower_bound, sigmoid_input_upper_bound
+        if logits.size == 0:
+            return
+        batch_lower = float(np.min(logits))
+        batch_upper = float(np.max(logits))
+        sigmoid_input_lower_bound = (
+            batch_lower
+            if sigmoid_input_lower_bound is None
+            else min(sigmoid_input_lower_bound, batch_lower)
+        )
+        sigmoid_input_upper_bound = (
+            batch_upper
+            if sigmoid_input_upper_bound is None
+            else max(sigmoid_input_upper_bound, batch_upper)
+        )
 
     for epoch_index in range(epochs):
         order = rng.permutation(n_examples)
@@ -188,6 +209,7 @@ def train_binary_logistic_regression(
             X_batch = X[batch_indices]
             y_batch = y[batch_indices]
             logits = binary_logits(X_batch, weights, bias)
+            record_sigmoid_input_bounds(logits)
             probabilities = sigmoid(logits)
             sample_weights = np.where(
                 y_batch == 1.0, positive_class_weight, negative_class_weight
@@ -217,6 +239,7 @@ def train_binary_logistic_regression(
                 )
 
     logits = binary_logits(X, weights, bias)
+    record_sigmoid_input_bounds(logits)
     probabilities = sigmoid(logits)
     sample_weights = np.where(y == 1.0, positive_class_weight, negative_class_weight)
     clipped = np.clip(probabilities, 1e-15, 1.0 - 1e-15)
@@ -231,4 +254,6 @@ def train_binary_logistic_regression(
         num_examples=n_examples,
         loss=loss,
         accuracy=accuracy,
+        sigmoid_input_lower_bound=sigmoid_input_lower_bound,
+        sigmoid_input_upper_bound=sigmoid_input_upper_bound,
     )

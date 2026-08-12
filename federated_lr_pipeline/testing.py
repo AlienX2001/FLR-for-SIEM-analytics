@@ -524,9 +524,53 @@ def load_testing_artifacts(
             for subcategory in fusion.subcategories_by_label[label]
         }
     )
+    cross_context = run_config.get("cross_context")
+    if cross_context is None:
+        context_window_minutes = 0.0
+        context_timestamp_epoch_field = "event_time_epoch"
+        context_timestamp_iso_field = "event_time_iso"
+        if "cross" in active_subcategories:
+            LOGGER.warning(
+                "Training run_config.json has no cross_context metadata; using "
+                "legacy row-local cross-feature extraction"
+            )
+    else:
+        if not isinstance(cross_context, dict):
+            raise ValueError("run_config.json cross_context must be an object")
+        version = int(cross_context.get("version", 0))
+        if version != 1:
+            raise ValueError(
+                f"Unsupported run_config.json cross_context version: {version}"
+            )
+        context_window_minutes = float(cross_context.get("window_minutes", 0.0))
+        if context_window_minutes not in {0.0, 15.0}:
+            raise ValueError(
+                "Saved cross_context.window_minutes must be 15 or 0 for the "
+                "fixed _15m vocabulary"
+            )
+        context_timestamp_epoch_field = cross_context.get("timestamp_epoch_field")
+        context_timestamp_iso_field = cross_context.get("timestamp_iso_field")
+        if context_window_minutes > 0 and not (
+            context_timestamp_epoch_field or context_timestamp_iso_field
+        ):
+            raise ValueError(
+                "Saved causal cross_context requires a timestamp field"
+            )
+        if (
+            context_timestamp_epoch_field
+            and context_timestamp_iso_field
+            and context_timestamp_epoch_field == context_timestamp_iso_field
+        ):
+            raise ValueError(
+                "Saved cross_context epoch and ISO timestamp fields must differ"
+            )
+
     texts_by_subcategory, _ = build_subcategory_texts(
         org_datasets,
         subcategories=active_subcategories,
+        context_window_minutes=context_window_minutes,
+        context_timestamp_epoch_field=context_timestamp_epoch_field,
+        context_timestamp_iso_field=context_timestamp_iso_field,
     )
     token_counters_by_subcategory = build_subcategory_token_counters(texts_by_subcategory)
     specialists: dict[str, dict[str, SpecialistState]] = {}
@@ -625,7 +669,11 @@ def run_testing_inference(
             feature_matrix_cache=feature_matrix_cache,
             cache_partition="testing_all",
         )
-        label_logits, probabilities = fused_probabilities(artifacts.fusion, logits_by_label)
+        label_logits, probabilities = fused_probabilities(
+            artifacts.fusion,
+            logits_by_label,
+            log_context=f"Testing inference org {dataset.org_index}",
+        )
         predictions = np.argmax(probabilities, axis=1)
         for subcategory in subcategory_predictions:
             subcategory_predictions[subcategory].extend(

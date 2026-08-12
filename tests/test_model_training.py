@@ -87,3 +87,17 @@ def test_binary_specialist_supports_one_vs_rest_targets() -> None:
     assert result.weights.shape == (3,)
     assert isinstance(result.bias, float)
     assert result.accuracy == 1.0
+
+
+def test_binary_specialist_reports_observed_sigmoid_input_bounds() -> None:
+    X = sparse.csr_matrix([[1.0, 0.0], [0.0, 2.0]], dtype=np.float32)
+    result = train_binary_logistic_regression(
+        X,
+        np.array([0, 1]),
+        np.array([2.0, -1.5]),
+        0.5,
+        epochs=0,
+    )
+
+    assert result.sigmoid_input_lower_bound == -2.5
+    assert result.sigmoid_input_upper_bound == 2.5

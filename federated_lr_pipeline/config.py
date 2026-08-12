@@ -34,6 +34,9 @@ class PipelineConfig:
     fusion_mode: str = "manual"
     use_global_model: bool = False
     debug_plaintext_vocab: bool = False
+    context_window_minutes: float = 15.0
+    context_timestamp_epoch_field: str | None = "event_time_epoch"
+    context_timestamp_iso_field: str | None = "event_time_iso"
     testing: bool = False
     model_artifact_dir: Path | None = None
     network_weights: Path | None = None
@@ -70,6 +73,13 @@ class PipelineConfig:
         if self.model_artifact_dir is not None:
             payload["model_artifact_dir"] = str(self.model_artifact_dir)
         payload["effective_label_column_default"] = self.label_column or "label"
+        payload["cross_context"] = {
+            "version": 1,
+            "causal": True,
+            "window_minutes": self.context_window_minutes,
+            "timestamp_epoch_field": self.context_timestamp_epoch_field,
+            "timestamp_iso_field": self.context_timestamp_iso_field,
+        }
         return payload
 
 
@@ -174,6 +184,25 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         help="Include plaintext feature tokens in inference explanations.",
     )
     parser.add_argument(
+        "--context-window-minutes",
+        default=15.0,
+        type=float,
+        help=(
+            "Causal cross-category event window. The fixed cross vocabulary currently "
+            "supports 15 minutes; use 0 to retain legacy row-local extraction."
+        ),
+    )
+    parser.add_argument(
+        "--context-timestamp-epoch-field",
+        default="event_time_epoch",
+        help="CSV field containing Unix epoch seconds for causal context ordering.",
+    )
+    parser.add_argument(
+        "--context-timestamp-iso-field",
+        default="event_time_iso",
+        help="CSV field containing ISO-8601 timestamps for causal context ordering.",
+    )
+    parser.add_argument(
         "--model-artifact-dir",
         default=None,
         type=Path,
@@ -272,6 +301,35 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         parser.error("--local-progress-interval must be non-negative")
     if not args.testing and args.num_workers <= 0:
         parser.error("--num-workers must be positive")
+    if not args.testing and args.context_window_minutes not in {0.0, 15.0}:
+        parser.error(
+            "--context-window-minutes must be 15 for the fixed _15m cross vocabulary "
+            "or 0 to disable causal context"
+        )
+    if (
+        not args.testing
+        and args.context_window_minutes > 0
+        and not (
+            str(args.context_timestamp_epoch_field).strip()
+            or str(args.context_timestamp_iso_field).strip()
+        )
+    ):
+        parser.error(
+            "Causal context requires --context-timestamp-epoch-field or "
+            "--context-timestamp-iso-field"
+        )
+    if (
+        not args.testing
+        and args.context_window_minutes > 0
+        and args.context_timestamp_epoch_field
+        and args.context_timestamp_iso_field
+        and args.context_timestamp_epoch_field.strip()
+        == args.context_timestamp_iso_field.strip()
+    ):
+        parser.error(
+            "--context-timestamp-epoch-field and --context-timestamp-iso-field "
+            "must name different columns"
+        )
     if not args.testing and not 0.0 < args.test_size < 1.0:
         parser.error("--test-size must be between 0 and 1")
     if not args.testing and args.fusion_mode == "meta":
@@ -293,6 +351,9 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         "--regularization",
         "--batch-size",
         "--num-workers",
+        "--context-window-minutes",
+        "--context-timestamp-epoch-field",
+        "--context-timestamp-iso-field",
     }
     testing_override_flags = {
         "--risk-threshold",
@@ -334,6 +395,17 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         fusion_mode=args.fusion_mode,
         use_global_model=args.use_global_model,
         debug_plaintext_vocab=args.debug_plaintext_vocab,
+        context_window_minutes=args.context_window_minutes,
+        context_timestamp_epoch_field=(
+            args.context_timestamp_epoch_field.strip()
+            if args.context_timestamp_epoch_field
+            else None
+        ),
+        context_timestamp_iso_field=(
+            args.context_timestamp_iso_field.strip()
+            if args.context_timestamp_iso_field
+            else None
+        ),
         testing=args.testing,
         model_artifact_dir=args.model_artifact_dir,
         network_weights=args.network_weights,

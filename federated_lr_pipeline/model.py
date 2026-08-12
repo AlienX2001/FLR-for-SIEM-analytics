@@ -3,6 +3,14 @@ from __future__ import annotations
 import numpy as np
 
 
+def observed_bounds(values: np.ndarray) -> tuple[float | None, float | None]:
+    """Return the observed minimum and maximum, or undefined bounds for no values."""
+    array = np.asarray(values, dtype=float)
+    if array.size == 0:
+        return None, None
+    return float(np.min(array)), float(np.max(array))
+
+
 def initialize_weights(
     num_features: int, num_classes: int, seed: int, scale: float = 0.01
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -19,4 +27,3 @@ def softmax(logits: np.ndarray) -> np.ndarray:
     exp_logits = np.exp(shifted)
     denominator = np.sum(exp_logits, axis=1, keepdims=True)
     return exp_logits / denominator
-

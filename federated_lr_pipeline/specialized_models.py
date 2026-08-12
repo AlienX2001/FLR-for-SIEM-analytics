@@ -6,10 +6,11 @@ import json
 import logging
 import math
 import re
-from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections import Counter, deque
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,7 @@ from federated_lr_pipeline.local_training import (
     train_binary_logistic_regression,
 )
 from federated_lr_pipeline.metrics import accuracy, classification_report_dict
-from federated_lr_pipeline.model import initialize_weights
+from federated_lr_pipeline.model import initialize_weights, observed_bounds
 from federated_lr_pipeline.prf import tag_namespaced_vocabulary
 from federated_lr_pipeline.utils import json_default, write_json, write_jsonl
 from federated_lr_pipeline.vocab import (
@@ -61,6 +62,48 @@ CROSS_TOKEN_SCOPES = (
     "same_host",
     "same_user",
 )
+CROSS_SCOPE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "same_host": ("host", "hostname", "Computer", "computer_name", "device_id"),
+    "same_user": (
+        "user_uid",
+        "user_euid",
+        "UserID",
+        "user",
+        "username",
+        "account_name",
+        "principal",
+        "identity",
+    ),
+    "same_session": ("session_id", "SessionID", "logon_id"),
+    "same_process_tree": (
+        "process_pid",
+        "process_ppid",
+        "process_tgid",
+        "parent_process",
+        "parent",
+    ),
+    "same_cloud_identity": (
+        "cloud_identity",
+        "managed_identity",
+        "principal",
+        "cloud_account",
+    ),
+    "same_src_ip": ("src_ip", "source_ip", "local_ip", "local_address"),
+    "same_dst_ip": ("dst_ip", "destination_ip", "remote_ip", "remote_address"),
+    "same_entity": ("entity_id", "source_entity_id", "target_entity_id"),
+    "same_service_account": (
+        "service_account",
+        "ServiceName",
+        "account_name",
+        "cloud_identity",
+    ),
+    "same_network_zone": ("network_zone", "src_ip", "dst_ip"),
+    "same_process_pid": ("process_pid", "ProcessID"),
+    "same_parent_process": ("process_ppid", "parent_process", "parent"),
+    "same_container": ("container_id", "container_name", "pod_name"),
+    "same_cluster": ("cluster", "cluster_name", "k8s_cluster"),
+    "same_cloud_account": ("cloud_account", "cloud_provider", "cloud_region"),
+}
 
 
 @dataclass(frozen=True)
@@ -123,6 +166,20 @@ class PreparedSpecialistJob:
     negative_class_weight: float
     log_every: int
     round_index: int
+
+
+@dataclass(frozen=True)
+class _PreparedCrossEvent:
+    row_index: int
+    timestamp: datetime | None
+    active_signals: frozenset[str]
+    scope_values: dict[str, frozenset[str]]
+
+
+@dataclass
+class _CrossWindowState:
+    events: deque[tuple[datetime, frozenset[str]]]
+    signal_counts: Counter[str]
 
 
 def _is_missing_value(value: Any) -> bool:
@@ -593,24 +650,7 @@ def _cross_signal_detectors() -> dict[str, Callable[[Mapping[str, Any] | pd.Seri
 
 
 def _scope_supported(row: Mapping[str, Any] | pd.Series, scope: str) -> bool:
-    scope_columns = {
-        "same_host": ["host", "hostname", "Computer", "computer_name", "device_id"],
-        "same_user": ["user_uid", "user_euid", "UserID", "user", "username", "account_name", "principal", "identity"],
-        "same_session": ["session_id", "SessionID", "logon_id"],
-        "same_process_tree": ["process_pid", "process_ppid", "process_tgid", "parent_process", "parent"],
-        "same_cloud_identity": ["cloud_identity", "managed_identity", "principal", "cloud_account"],
-        "same_src_ip": ["src_ip", "source_ip", "local_ip", "local_address"],
-        "same_dst_ip": ["dst_ip", "destination_ip", "remote_ip", "remote_address"],
-        "same_entity": ["entity_id", "source_entity_id", "target_entity_id"],
-        "same_service_account": ["service_account", "ServiceName", "account_name", "cloud_identity"],
-        "same_network_zone": ["network_zone", "network_direction", "src_ip", "dst_ip"],
-        "same_process_pid": ["process_pid", "ProcessID"],
-        "same_parent_process": ["process_ppid", "parent_process", "parent"],
-        "same_container": ["container_id", "container_name", "pod_name"],
-        "same_cluster": ["cluster", "cluster_name", "k8s_cluster"],
-        "same_cloud_account": ["cloud_account", "cloud_provider", "cloud_region"],
-    }
-    return _any_present(row, scope_columns.get(scope, []))
+    return _any_present(row, list(CROSS_SCOPE_COLUMNS.get(scope, ())))
 
 
 def _parse_cross_token(token: str) -> tuple[str, str, str] | None:
@@ -635,6 +675,252 @@ CROSS_TOKEN_SPECS = tuple(
     for token in CROSS_CATEGORY_TOKENS
     if (parsed := _parse_cross_token(token)) is not None
 )
+CROSS_TOKEN_BY_SPEC = {
+    (scope, left_signal, right_signal): token
+    for token, left_signal, right_signal, scope in CROSS_TOKEN_SPECS
+}
+CROSS_TOKEN_ORDER = {
+    token: index for index, token in enumerate(CROSS_CATEGORY_TOKENS)
+}
+
+
+def _parse_epoch_timestamp(value: Any) -> datetime | None:
+    if _is_missing_value(value):
+        return None
+    try:
+        numeric = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric) or numeric < 0:
+        return None
+    try:
+        return datetime.fromtimestamp(numeric, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _parse_iso_timestamp(value: Any) -> datetime | None:
+    if _is_missing_value(value):
+        return None
+    text = str(value).strip()
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _context_timestamp(
+    row: Mapping[str, Any] | pd.Series,
+    *,
+    epoch_field: str | None,
+    iso_field: str | None,
+) -> tuple[datetime | None, str | None]:
+    epoch_present = bool(
+        epoch_field
+        and _row_has(row, epoch_field)
+        and not _is_missing_value(_row_get(row, epoch_field))
+    )
+    iso_present = bool(
+        iso_field
+        and _row_has(row, iso_field)
+        and not _is_missing_value(_row_get(row, iso_field))
+    )
+    if not epoch_present and not iso_present:
+        return None, "missing"
+
+    epoch_timestamp = (
+        _parse_epoch_timestamp(_row_get(row, epoch_field))
+        if epoch_present and epoch_field is not None
+        else None
+    )
+    iso_timestamp = (
+        _parse_iso_timestamp(_row_get(row, iso_field))
+        if iso_present and iso_field is not None
+        else None
+    )
+    if (epoch_present and epoch_timestamp is None) or (
+        iso_present and iso_timestamp is None
+    ):
+        return None, "invalid"
+    if epoch_timestamp is not None and iso_timestamp is not None:
+        if abs((epoch_timestamp - iso_timestamp).total_seconds()) > 1.0:
+            return None, "conflict"
+        return epoch_timestamp, None
+    return epoch_timestamp or iso_timestamp, None
+
+
+def _canonical_scope_value(value: Any) -> str | None:
+    if _is_missing_value(value):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)) and math.isfinite(float(value)):
+        numeric = float(value)
+        return str(int(numeric)) if numeric.is_integer() else str(numeric)
+    normalized = _field_value(value)
+    return normalized or None
+
+
+def _scope_values_for_row(
+    row: Mapping[str, Any] | pd.Series,
+) -> dict[str, frozenset[str]]:
+    result: dict[str, frozenset[str]] = {}
+    for scope, columns in CROSS_SCOPE_COLUMNS.items():
+        values = {
+            normalized
+            for column in columns
+            if _row_has(row, column)
+            and (normalized := _canonical_scope_value(_row_get(row, column))) is not None
+        }
+        if values:
+            result[scope] = frozenset(values)
+    return result
+
+
+def _active_cross_signals(
+    row: Mapping[str, Any] | pd.Series,
+) -> frozenset[str]:
+    return frozenset(
+        signal
+        for signal, detector in CROSS_SIGNAL_DETECTORS.items()
+        if detector(row)
+    )
+
+
+def _tokens_closed_by_current_event(
+    *,
+    scope: str,
+    current_signals: frozenset[str],
+    available_signals: set[str] | frozenset[str],
+) -> set[str]:
+    tokens: set[str] = set()
+    for current_signal in current_signals:
+        for other_signal in available_signals:
+            token = CROSS_TOKEN_BY_SPEC.get((scope, current_signal, other_signal))
+            if token is not None:
+                tokens.add(token)
+            reverse_token = CROSS_TOKEN_BY_SPEC.get(
+                (scope, other_signal, current_signal)
+            )
+            if reverse_token is not None:
+                tokens.add(reverse_token)
+    return tokens
+
+
+def _single_event_cross_tokens(event: _PreparedCrossEvent) -> list[str]:
+    tokens: set[str] = set()
+    for scope in event.scope_values:
+        tokens.update(
+            _tokens_closed_by_current_event(
+                scope=scope,
+                current_signals=event.active_signals,
+                available_signals=event.active_signals,
+            )
+        )
+    return sorted(tokens, key=CROSS_TOKEN_ORDER.__getitem__)
+
+
+def contextual_cross_tokens_for_rows(
+    rows: Iterable[Mapping[str, Any] | pd.Series],
+    *,
+    window_minutes: float = 15.0,
+    timestamp_epoch_field: str | None = "event_time_epoch",
+    timestamp_iso_field: str | None = "event_time_iso",
+) -> list[list[str]]:
+    """Build causal cross-event tokens while preserving input row order.
+
+    A token is emitted for the event that closes a configured signal pair. The
+    counterpart signal may come from the same row or from an earlier event with
+    the same scope value inside the inclusive rolling window.
+    """
+    if window_minutes <= 0:
+        return [cross_tokens_for_row(row) for row in rows]
+
+    prepared_events: list[_PreparedCrossEvent] = []
+    timestamp_issue_counts: Counter[str] = Counter()
+    for row_index, row in enumerate(rows):
+        timestamp, timestamp_issue = _context_timestamp(
+            row,
+            epoch_field=timestamp_epoch_field,
+            iso_field=timestamp_iso_field,
+        )
+        if timestamp_issue is not None:
+            timestamp_issue_counts[timestamp_issue] += 1
+        prepared_events.append(
+            _PreparedCrossEvent(
+                row_index=row_index,
+                timestamp=timestamp,
+                active_signals=_active_cross_signals(row),
+                scope_values=_scope_values_for_row(row),
+            )
+        )
+
+    tokens_by_row: list[list[str]] = [[] for _ in prepared_events]
+    for event in prepared_events:
+        if event.timestamp is None:
+            tokens_by_row[event.row_index] = _single_event_cross_tokens(event)
+
+    timestamped_events = sorted(
+        (event for event in prepared_events if event.timestamp is not None),
+        key=lambda event: (event.timestamp, event.row_index),
+    )
+    window = timedelta(minutes=float(window_minutes))
+    states: dict[tuple[str, str], _CrossWindowState] = {}
+
+    for event in timestamped_events:
+        assert event.timestamp is not None
+        event_tokens: set[str] = set()
+        for scope, values in event.scope_values.items():
+            for value in values:
+                state = states.setdefault(
+                    (scope, value),
+                    _CrossWindowState(events=deque(), signal_counts=Counter()),
+                )
+                cutoff = event.timestamp - window
+                while state.events and state.events[0][0] < cutoff:
+                    _, expired_signals = state.events.popleft()
+                    for signal in expired_signals:
+                        state.signal_counts[signal] -= 1
+                        if state.signal_counts[signal] <= 0:
+                            del state.signal_counts[signal]
+
+                available_signals = set(state.signal_counts)
+                available_signals.update(event.active_signals)
+                event_tokens.update(
+                    _tokens_closed_by_current_event(
+                        scope=scope,
+                        current_signals=event.active_signals,
+                        available_signals=available_signals,
+                    )
+                )
+
+        if event.active_signals:
+            for scope, values in event.scope_values.items():
+                for value in values:
+                    state = states[(scope, value)]
+                    state.events.append((event.timestamp, event.active_signals))
+                    state.signal_counts.update(event.active_signals)
+        tokens_by_row[event.row_index] = sorted(
+            event_tokens,
+            key=CROSS_TOKEN_ORDER.__getitem__,
+        )
+
+    if timestamp_issue_counts:
+        LOGGER.warning(
+            "Cross-context extraction used single-row evidence for %s row(s) "
+            "without a reliable timestamp (%s)",
+            sum(timestamp_issue_counts.values()),
+            ", ".join(
+                f"{reason}={count}"
+                for reason, count in sorted(timestamp_issue_counts.items())
+            ),
+        )
+    return tokens_by_row
 
 
 def cross_tokens_for_row(row: Mapping[str, Any] | pd.Series) -> list[str]:
@@ -694,18 +980,41 @@ def cross_tokens_for_row(row: Mapping[str, Any] | pd.Series) -> list[str]:
     return list(dict.fromkeys(tokens))
 
 
-def build_cross_texts_for_org(dataset: OrgDataset) -> tuple[list[str], list[str]]:
+def build_cross_texts_for_org(
+    dataset: OrgDataset,
+    *,
+    context_window_minutes: float = 0.0,
+    context_timestamp_epoch_field: str | None = "event_time_epoch",
+    context_timestamp_iso_field: str | None = "event_time_iso",
+) -> tuple[list[str], list[str]]:
     columns = list(dataset.logs_df.columns)
-    texts: list[str] = []
-    for values in dataset.logs_df.itertuples(index=False, name=None):
-        row = dict(zip(columns, values))
-        texts.append(" ".join(cross_tokens_for_row(row)))
+    rows = (
+        dict(zip(columns, values))
+        for values in dataset.logs_df.itertuples(index=False, name=None)
+    )
+    token_rows = contextual_cross_tokens_for_rows(
+        rows,
+        window_minutes=context_window_minutes,
+        timestamp_epoch_field=context_timestamp_epoch_field,
+        timestamp_iso_field=context_timestamp_iso_field,
+    )
+    texts = [" ".join(tokens) for tokens in token_rows]
+    if context_window_minutes > 0:
+        LOGGER.info(
+            "Organization %s cross features use a causal %.1f-minute context window",
+            dataset.org_index,
+            context_window_minutes,
+        )
     return texts, []
 
 
 def build_subcategory_texts(
     org_datasets: list[OrgDataset],
     subcategories: Sequence[str] | None = None,
+    *,
+    context_window_minutes: float = 0.0,
+    context_timestamp_epoch_field: str | None = "event_time_epoch",
+    context_timestamp_iso_field: str | None = "event_time_iso",
 ) -> tuple[dict[str, list[list[str]]], dict[str, dict[int, list[str]]]]:
     selected_subcategories = list(subcategories) if subcategories is not None else list(SUBCATEGORY_NAMES)
     texts_by_subcategory: dict[str, list[list[str]]] = {
@@ -719,7 +1028,12 @@ def build_subcategory_texts(
             raise ValueError(f"Unsupported subcategory: {subcategory}")
         for dataset in org_datasets:
             if subcategory == "cross":
-                texts, missing = build_cross_texts_for_org(dataset)
+                texts, missing = build_cross_texts_for_org(
+                    dataset,
+                    context_window_minutes=context_window_minutes,
+                    context_timestamp_epoch_field=context_timestamp_epoch_field,
+                    context_timestamp_iso_field=context_timestamp_iso_field,
+                )
             else:
                 texts, missing = build_specialized_texts_for_org(
                     dataset,
@@ -1059,6 +1373,8 @@ def _run_prepared_specialist_job(job: PreparedSpecialistJob) -> tuple[Specialist
         "num_features": len(job.index_vector),
         "positive_class_weight": job.positive_class_weight,
         "negative_class_weight": job.negative_class_weight,
+        "sigmoid_input_lower_bound": local_result.sigmoid_input_lower_bound,
+        "sigmoid_input_upper_bound": local_result.sigmoid_input_upper_bound,
     }
     return update, metrics
 
@@ -1159,16 +1475,42 @@ def train_specialist_round(
     for update, metrics in results:
         metrics["num_test_examples"] = test_counts_by_org[update.org_index]
         local_metrics.append(metrics)
+        LOGGER.info(
+            "Round %s/%s %s/%s org %s sigmoid input bounds: lower=%s upper=%s",
+            round_index + 1,
+            total_rounds,
+            state.label,
+            state.subcategory,
+            update.org_index,
+            metrics["sigmoid_input_lower_bound"],
+            metrics["sigmoid_input_upper_bound"],
+        )
     state.weights, state.bias = _aggregate_specialist_updates(
         state.weights,
         state.bias,
         updates,
         weighting=config.aggregation_weighting,
     )
+    sigmoid_lower_bounds = [
+        metric["sigmoid_input_lower_bound"]
+        for metric in local_metrics
+        if metric["sigmoid_input_lower_bound"] is not None
+    ]
+    sigmoid_upper_bounds = [
+        metric["sigmoid_input_upper_bound"]
+        for metric in local_metrics
+        if metric["sigmoid_input_upper_bound"] is not None
+    ]
     return {
         "local_metrics": local_metrics,
         "num_global_features": len(state.global_tags),
         "num_features_per_org": [len(tokens) for tokens in state.org_vocab_tokens],
+        "sigmoid_input_lower_bound": (
+            min(sigmoid_lower_bounds) if sigmoid_lower_bounds else None
+        ),
+        "sigmoid_input_upper_bound": (
+            max(sigmoid_upper_bounds) if sigmoid_upper_bounds else None
+        ),
     }
 
 
@@ -1233,6 +1575,8 @@ def evaluate_hierarchical_ensemble(
     labels_all: list[int] = []
     predictions_all: list[int] = []
     per_org: list[dict[str, Any]] = []
+    softmax_lower_bounds: list[float] = []
+    softmax_upper_bounds: list[float] = []
     for org_position, (labels, split) in enumerate(zip(encoded_labels_by_org, splits)):
         logits_by_label, _ = collect_logits_for_rows(
             specialists,
@@ -1242,7 +1586,16 @@ def evaluate_hierarchical_ensemble(
             feature_matrix_cache=feature_matrix_cache,
             cache_partition="test",
         )
-        _, probabilities = fused_probabilities(fusion, logits_by_label)
+        label_logits, probabilities = fused_probabilities(
+            fusion,
+            logits_by_label,
+            log_context=f"Ensemble evaluation org {org_position}",
+        )
+        lower_bound, upper_bound = observed_bounds(label_logits)
+        if lower_bound is not None:
+            softmax_lower_bounds.append(lower_bound)
+        if upper_bound is not None:
+            softmax_upper_bounds.append(upper_bound)
         predictions = np.argmax(probabilities, axis=1)
         test_labels = labels[split.test_indices]
         labels_all.extend(test_labels.tolist())
@@ -1252,6 +1605,8 @@ def evaluate_hierarchical_ensemble(
                 "org_index": org_position,
                 "test_accuracy": accuracy(test_labels, predictions),
                 "num_test_examples": len(test_labels),
+                "softmax_input_lower_bound": lower_bound,
+                "softmax_input_upper_bound": upper_bound,
             }
         )
     labels_array = np.asarray(labels_all, dtype=int)
@@ -1264,6 +1619,12 @@ def evaluate_hierarchical_ensemble(
             class_names,
         ),
         "per_org": per_org,
+        "softmax_input_lower_bound": (
+            min(softmax_lower_bounds) if softmax_lower_bounds else None
+        ),
+        "softmax_input_upper_bound": (
+            max(softmax_upper_bounds) if softmax_upper_bounds else None
+        ),
     }
 
 
@@ -1332,7 +1693,11 @@ def generate_hierarchical_predictions(
             feature_matrix_cache={},
             cache_partition="predict_all",
         )
-        label_logits, probabilities = fused_probabilities(fusion, logits_by_label)
+        label_logits, probabilities = fused_probabilities(
+            fusion,
+            logits_by_label,
+            log_context=f"Inference org {dataset.org_index}",
+        )
         predictions = np.argmax(probabilities, axis=1)
 
         for row_index in range(len(dataset.labels)):

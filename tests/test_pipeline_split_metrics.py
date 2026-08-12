@@ -166,7 +166,14 @@ def test_pipeline_reports_held_out_test_metrics_and_class_weights(tmp_path: Path
     assert set(final_round["specialists"]) == {"benign", "malicious"}
     assert "global_training_metrics" not in final_round
     assert "test_accuracy" in final_round["ensemble_metrics"]
+    assert "softmax_input_lower_bound" in final_round["ensemble_metrics"]
+    assert "softmax_input_upper_bound" in final_round["ensemble_metrics"]
     assert final_round["ensemble_metrics"]["per_org"][0]["num_test_examples"] == 2
+    first_specialist = final_round["specialists"]["benign"]["system"]
+    assert "sigmoid_input_lower_bound" in first_specialist
+    assert "sigmoid_input_upper_bound" in first_specialist
+    assert "sigmoid_input_lower_bound" in first_specialist["local_metrics"][0]
+    assert "sigmoid_input_upper_bound" in first_specialist["local_metrics"][0]
     assert (output_dir / "hierarchical_model_manifest.json").exists()
     assert (output_dir / "manual_logit_fusion.json").exists()
     assert (output_dir / "final_benign_system_weights.npy").exists()
