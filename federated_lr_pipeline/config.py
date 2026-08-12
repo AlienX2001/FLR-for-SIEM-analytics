@@ -80,6 +80,11 @@ class PipelineConfig:
             "timestamp_epoch_field": self.context_timestamp_epoch_field,
             "timestamp_iso_field": self.context_timestamp_iso_field,
         }
+        payload["prf_namespace"] = {
+            "version": 2,
+            "format": "subcategory|token",
+        }
+        payload["global_weight_coordinate_system"] = "tf"
         return payload
 
 

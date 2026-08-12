@@ -77,6 +77,53 @@ def build_token_counters(
     return counters
 
 
+def idf_from_document_frequency(
+    document_frequency: np.ndarray,
+    n_documents: int,
+) -> np.ndarray:
+    document_frequency = np.asarray(document_frequency, dtype=np.float64)
+    return np.log(
+        (1.0 + max(1, int(n_documents))) / (1.0 + document_frequency)
+    ) + 1.0
+
+
+def compute_local_idf(
+    token_counters: list[Mapping[str, int]],
+    vocab_tokens: list[str],
+) -> np.ndarray:
+    """Compute the local IDF vector without exposing it to the server."""
+    token_to_index = {token: index for index, token in enumerate(vocab_tokens)}
+    document_frequency = np.zeros(len(vocab_tokens), dtype=np.float64)
+    for counts in token_counters:
+        for token, count in counts.items():
+            column_index = token_to_index.get(token)
+            if column_index is not None and count != 0:
+                document_frequency[column_index] += 1.0
+    return idf_from_document_frequency(document_frequency, len(token_counters))
+
+
+def tf_weights_to_tfidf(weights: np.ndarray, idf: np.ndarray) -> np.ndarray:
+    """Convert TF-space weights to equivalent local TF-IDF coordinates."""
+    weights = np.asarray(weights, dtype=float)
+    idf = np.asarray(idf, dtype=float)
+    if weights.shape != idf.shape:
+        raise ValueError("weights and idf must have the same shape")
+    if np.any(~np.isfinite(idf)) or np.any(idf <= 0):
+        raise ValueError("idf values must be finite and positive")
+    return weights / idf
+
+
+def tfidf_weights_to_tf(weights: np.ndarray, idf: np.ndarray) -> np.ndarray:
+    """Convert local TF-IDF weights to equivalent server TF coordinates."""
+    weights = np.asarray(weights, dtype=float)
+    idf = np.asarray(idf, dtype=float)
+    if weights.shape != idf.shape:
+        raise ValueError("weights and idf must have the same shape")
+    if np.any(~np.isfinite(idf)) or np.any(idf <= 0):
+        raise ValueError("idf values must be finite and positive")
+    return weights * idf
+
+
 def build_feature_matrix_from_counters(
     token_counters: list[Mapping[str, int]],
     vocab_tokens: list[str],
@@ -121,8 +168,7 @@ def build_feature_matrix_from_counters(
         dtype=np.float32,
     )
     if mode == "tfidf" and n_cols:
-        n_docs = max(1, n_rows)
-        idf = np.log((1.0 + n_docs) / (1.0 + document_frequency)) + 1.0
+        idf = idf_from_document_frequency(document_frequency, n_rows)
         X = X.multiply(idf.astype(np.float32)).tocsr()
 
     return X

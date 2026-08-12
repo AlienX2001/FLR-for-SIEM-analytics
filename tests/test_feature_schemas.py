@@ -59,3 +59,15 @@ def test_cross_token_extractor_preserves_original_five_conditions() -> None:
 
     for token in CROSS_CATEGORY_TOKENS[:5]:
         assert token in tokens
+
+
+def test_new_tls_sni_cross_signal_is_reachable() -> None:
+    tokens = cross_tokens_for_row(
+        {
+            "host": "HOST-01",
+            "process_command_line": "powershell.exe -EncodedCommand SQBFAFgA",
+            "tls_sni": "first-seen.example",
+        }
+    )
+
+    assert "cross:encoded_command_AND_new_tls_sni_same_host_15m" in tokens

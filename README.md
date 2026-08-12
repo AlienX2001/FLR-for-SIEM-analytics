@@ -64,8 +64,13 @@ The pipeline never averages probabilities for the final decision.
 Organizations generate local vocabularies. Each token is tagged with HMAC-SHA256 using a namespace:
 
 ```text
-tag = PRF(k, label + "|" + subcategory + "|" + canonical_token)
+tag = PRF(k, subcategory + "|" + canonical_token)
 ```
+
+All label specialists for one subcategory therefore use the same PRF-tagged
+feature axis. Different subcategories remain cryptographically separated. Models
+created with the earlier `label|subcategory|token` namespace must be retrained to
+use this axis-sharing contract.
 
 The server builds global vocabularies from PRF tags only:
 
@@ -85,7 +90,14 @@ Cross-category features use a fixed vocabulary before training. Examples:
 - `cross:failed_login_burst_AND_successful_login_same_user_15m`
 - `cross:secret_read_tool_AND_external_post_same_user_15m`
 
-These features are generated from primitive signals before training and are PRF-tagged with the same label/subcategory namespace.
+These features are generated from primitive signals before training and are PRF-tagged with the `cross|token` namespace.
+
+Global specialist weights are maintained in TF coordinates. During round 0, each
+organization computes IDF locally, converts incoming TF weights to equivalent
+local TF-IDF coordinates, trains on TF-IDF, and converts the outgoing weights back
+to TF coordinates before aggregation. Local IDF values are not sent to the
+server. Evaluation and subsequent rounds use TF, so their logits are in the same
+coordinate system as the aggregated weights.
 
 Cross features use an organization-local, causal 15-minute event window. Rows are
 processed in stable timestamp order, but generated features remain aligned to the

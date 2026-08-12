@@ -33,26 +33,37 @@ def _dataset() -> OrgDataset:
     )
 
 
-def test_prf_namespacing_separates_same_token_across_labels() -> None:
+def test_prf_namespacing_shares_same_token_across_labels() -> None:
     key = derive_prf_key(42)
 
     data_tag = tag_namespaced_vocabulary(
         ["large_upload"],
         key,
-        label="data_exfiltration",
         subcategory="network",
     )[0]
     credential_tag = tag_namespaced_vocabulary(
         ["large_upload"],
         key,
-        label="credential_attack",
         subcategory="network",
     )[0]
 
-    assert data_tag != credential_tag
+    assert data_tag == credential_tag
 
 
-def test_label_subcategory_specialists_have_separate_gvs() -> None:
+def test_prf_namespacing_separates_subcategories() -> None:
+    key = derive_prf_key(42)
+
+    network_tag = tag_namespaced_vocabulary(
+        ["shared=value"], key, subcategory="network"
+    )[0]
+    system_tag = tag_namespaced_vocabulary(
+        ["shared=value"], key, subcategory="system"
+    )[0]
+
+    assert network_tag != system_tag
+
+
+def test_labels_in_same_subcategory_share_gv_axis() -> None:
     dataset = _dataset()
     split = Split(train_indices=np.array([0]), test_indices=np.array([], dtype=int))
     key = derive_prf_key(42)
@@ -87,5 +98,5 @@ def test_label_subcategory_specialists_have_separate_gvs() -> None:
     )
 
     assert data_state.org_vocab_tokens[0] == credential_state.org_vocab_tokens[0]
-    assert data_state.global_tags != credential_state.global_tags
-    assert data_state.org_index_vectors is not credential_state.org_index_vectors
+    assert data_state.global_tags == credential_state.global_tags
+    assert data_state.org_index_vectors == credential_state.org_index_vectors

@@ -30,6 +30,9 @@ from federated_lr_pipeline.local_training import (
     binary_logits,
     build_feature_matrix,
     build_token_counters,
+    compute_local_idf,
+    tf_weights_to_tfidf,
+    tfidf_weights_to_tf,
     train_binary_logistic_regression,
 )
 from federated_lr_pipeline.metrics import accuracy, classification_report_dict
@@ -157,6 +160,7 @@ class PreparedSpecialistJob:
     train_targets: np.ndarray
     initial_weights: np.ndarray
     initial_bias: float
+    local_idf: np.ndarray | None
     learning_rate: float
     batch_size: int
     epochs: int
@@ -630,6 +634,7 @@ def _cross_signal_detectors() -> dict[str, Callable[[Mapping[str, Any] | pd.Seri
         "proxy_bypass_connection": proxy_bypass_connection,
         "cloud_storage_upload": cloud_storage_upload,
         "unusual_dst_port": unusual_dst_port,
+        "new_tls_sni": new_tls_sni,
         "new_external_asn": lambda row: _value_contains_anywhere(row, ["new_asn", "new_external_asn"]),
         "new_geolocation": lambda row: _value_contains_anywhere(row, ["new_geo", "new_geolocation"]),
         "high_entropy_domain": _has_high_entropy_domain,
@@ -1194,7 +1199,6 @@ def initialize_specialist(
         tag_namespaced_vocabulary(
             tokens,
             prf_key,
-            label=label,
             subcategory=subcategory,
         )
         for tokens in org_vocab_tokens
@@ -1359,7 +1363,11 @@ def _run_prepared_specialist_job(job: PreparedSpecialistJob) -> tuple[Specialist
     update = SpecialistUpdate(
         org_index=job.org_index,
         index_vector=job.index_vector,
-        weights=local_result.weights,
+        weights=(
+            tfidf_weights_to_tf(local_result.weights, job.local_idf)
+            if job.local_idf is not None
+            else local_result.weights
+        ),
         bias=local_result.bias,
         num_examples=local_result.num_examples,
         loss=local_result.loss,
@@ -1373,6 +1381,8 @@ def _run_prepared_specialist_job(job: PreparedSpecialistJob) -> tuple[Specialist
         "num_features": len(job.index_vector),
         "positive_class_weight": job.positive_class_weight,
         "negative_class_weight": job.negative_class_weight,
+        "weight_coordinate_system": "tf",
+        "local_feature_mode": "tfidf" if job.local_idf is not None else "tf",
         "sigmoid_input_lower_bound": local_result.sigmoid_input_lower_bound,
         "sigmoid_input_upper_bound": local_result.sigmoid_input_upper_bound,
     }
@@ -1439,9 +1449,21 @@ def train_specialist_round(
             feature_matrix_cache=feature_matrix_cache,
             cache_partition="train",
         )
-        local_initial_weights = (
+        server_tf_weights = (
             state.weights[index_vector] if index_vector else state.weights[:0]
         )
+        local_idf = None
+        local_initial_weights = server_tf_weights
+        if mode == "tfidf":
+            train_counters = select_items(
+                state.org_token_counters[org_position],
+                split.train_indices,
+            )
+            local_idf = compute_local_idf(train_counters, vocab_tokens)
+            local_initial_weights = tf_weights_to_tfidf(
+                server_tf_weights,
+                local_idf,
+            )
         test_counts_by_org[dataset.org_index] = len(split.test_indices)
         prepared_jobs.append(
             PreparedSpecialistJob(
@@ -1452,6 +1474,7 @@ def train_specialist_round(
                 train_targets=train_targets,
                 initial_weights=local_initial_weights,
                 initial_bias=state.bias,
+                local_idf=local_idf,
                 learning_rate=config.learning_rate,
                 batch_size=config.batch_size,
                 epochs=config.local_epochs,
@@ -1768,6 +1791,8 @@ def save_hierarchical_artifacts(
                 "global_vocabulary_tags": f"{prefix}_global_vocabulary_tags.json",
                 "weights": f"final_{prefix}_weights.npy",
                 "bias": f"final_{prefix}_bias.npy",
+                "prf_namespace": "subcategory|token",
+                "weight_coordinate_system": "tf",
                 "num_global_features": len(state.global_tags),
                 "missing_columns_by_org": state.missing_columns_by_org,
                 "per_org_artifacts": [],

@@ -5,7 +5,12 @@ from scipy import sparse
 
 from federated_lr_pipeline.local_training import (
     binary_logits,
+    build_feature_matrix_from_counters,
+    build_token_counters,
+    compute_local_idf,
     sigmoid,
+    tf_weights_to_tfidf,
+    tfidf_weights_to_tf,
     train_binary_logistic_regression,
 )
 
@@ -101,3 +106,23 @@ def test_binary_specialist_reports_observed_sigmoid_input_bounds() -> None:
 
     assert result.sigmoid_input_lower_bound == -2.5
     assert result.sigmoid_input_upper_bound == 2.5
+
+
+def test_local_idf_weight_conversion_preserves_tf_logits() -> None:
+    texts = ["common rare", "common"]
+    vocabulary = ["common", "rare"]
+    counters = build_token_counters(texts)
+    X_tf = build_feature_matrix_from_counters(counters, vocabulary, mode="tf")
+    X_tfidf = build_feature_matrix_from_counters(counters, vocabulary, mode="tfidf")
+    idf = compute_local_idf(counters, vocabulary)
+    tf_weights = np.array([1.5, -2.0])
+
+    tfidf_weights = tf_weights_to_tfidf(tf_weights, idf)
+
+    np.testing.assert_allclose(
+        binary_logits(X_tf, tf_weights, 0.25),
+        binary_logits(X_tfidf, tfidf_weights, 0.25),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(tfidf_weights_to_tf(tfidf_weights, idf), tf_weights)

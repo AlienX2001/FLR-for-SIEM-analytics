@@ -16,18 +16,17 @@ def tag_vocabulary(tokens: list[str], key: bytes) -> list[str]:
     return [hmac_sha256_tag(key, token) for token in tokens]
 
 
-def namespaced_token(label: str, subcategory: str, token: str) -> str:
-    return f"{label}|{subcategory}|{token}"
+def namespaced_token(subcategory: str, token: str) -> str:
+    return f"{subcategory}|{token}"
 
 
 def tag_namespaced_vocabulary(
     tokens: list[str],
     key: bytes,
     *,
-    label: str,
     subcategory: str,
 ) -> list[str]:
     return [
-        hmac_sha256_tag(key, namespaced_token(label, subcategory, token))
+        hmac_sha256_tag(key, namespaced_token(subcategory, token))
         for token in tokens
     ]
