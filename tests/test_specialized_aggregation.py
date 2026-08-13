@@ -7,6 +7,7 @@ import numpy as np
 from federated_lr_pipeline.config import PipelineConfig
 from federated_lr_pipeline.data import OrgDataset
 from federated_lr_pipeline.local_training import build_token_counters
+from federated_lr_pipeline.prf import derive_prf_key
 from federated_lr_pipeline.specialized_models import (
     SpecialistState,
     SpecialistUpdate,
@@ -93,6 +94,7 @@ def test_round_zero_returns_tfidf_weights_to_server_tf_coordinates() -> None:
         weights=initial_weights.copy(),
         bias=0.25,
         missing_columns_by_org={0: []},
+        prf_key=derive_prf_key(42),
     )
     config = PipelineConfig(
         org_data=[],

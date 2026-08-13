@@ -47,7 +47,10 @@ from federated_lr_pipeline.vocab import (
 
 LOGGER = logging.getLogger(__name__)
 SUBTOKEN_RE = re.compile(r"[A-Za-z0-9]{2,}")
-FeatureMatrixCache = dict[tuple[str, str, int, str], tuple[tuple[str, ...], sparse.csr_matrix]]
+FeatureMatrixCache = dict[
+    tuple[str, str, int, str],
+    tuple[tuple[str, ...], sparse.csr_matrix],
+]
 CROSS_TOKEN_SCOPES = (
     "same_cloud_identity",
     "same_service_account",
@@ -138,6 +141,7 @@ class SpecialistState:
     weights: np.ndarray
     bias: float
     missing_columns_by_org: dict[int, list[str]]
+    prf_key: bytes
 
 
 @dataclass(frozen=True)
@@ -1222,6 +1226,7 @@ def initialize_specialist(
         weights=weights[:, 0],
         bias=float(bias_vector[0]),
         missing_columns_by_org=missing_columns_by_org,
+        prf_key=prf_key,
     )
 
 
@@ -1340,6 +1345,99 @@ def _feature_matrix_for_rows(
         log_every=log_every,
         org_index=org_position,
         round_index=round_index,
+    )
+
+
+def build_global_prf_feature_matrix(
+    token_counters: Sequence[Mapping[str, int]],
+    *,
+    subcategory: str,
+    prf_key: bytes,
+    global_tags: list[str],
+) -> sparse.csr_matrix:
+    """Project all observed query tokens directly into a global PRF-tag axis."""
+    n_rows = len(token_counters)
+    n_columns = len(global_tags)
+    if n_rows == 0 or n_columns == 0:
+        return sparse.csr_matrix((n_rows, n_columns), dtype=np.float32)
+
+    global_tag_to_index = {
+        tag: index for index, tag in enumerate(global_tags)
+    }
+    unique_tokens = sorted(
+        {
+            token
+            for counter in token_counters
+            for token, count in counter.items()
+            if count != 0
+        }
+    )
+    token_tags = tag_namespaced_vocabulary(
+        unique_tokens,
+        prf_key,
+        subcategory=subcategory,
+    )
+    token_to_global_index = {
+        token: global_tag_to_index[tag]
+        for token, tag in zip(unique_tokens, token_tags)
+        if tag in global_tag_to_index
+    }
+
+    row_indices: list[int] = []
+    column_indices: list[int] = []
+    values: list[float] = []
+    for row_index, counts in enumerate(token_counters):
+        for token, count in counts.items():
+            global_index = token_to_global_index.get(token)
+            if global_index is None or count == 0:
+                continue
+            row_indices.append(row_index)
+            column_indices.append(global_index)
+            values.append(float(count))
+
+    matrix = sparse.csr_matrix(
+        (
+            np.asarray(values, dtype=np.float32),
+            (
+                np.asarray(row_indices, dtype=np.int64),
+                np.asarray(column_indices, dtype=np.int64),
+            ),
+        ),
+        shape=(n_rows, n_columns),
+        dtype=np.float32,
+    )
+    matrix.sum_duplicates()
+    return matrix
+
+
+def _global_feature_matrix_for_rows(
+    *,
+    state: SpecialistState,
+    org_position: int,
+    row_indices: np.ndarray,
+    feature_matrix_cache: FeatureMatrixCache | None = None,
+    cache_partition: str | None = None,
+) -> sparse.csr_matrix:
+    counters = select_items(state.org_token_counters[org_position], row_indices)
+    if feature_matrix_cache is not None and cache_partition is not None:
+        key = (cache_partition, state.subcategory, org_position, "global_tf")
+        global_axis = tuple(state.global_tags)
+        cached = feature_matrix_cache.get(key)
+        if cached is not None and cached[0] == global_axis:
+            return cached[1]
+        matrix = build_global_prf_feature_matrix(
+            counters,
+            subcategory=state.subcategory,
+            prf_key=state.prf_key,
+            global_tags=state.global_tags,
+        )
+        feature_matrix_cache[key] = (global_axis, matrix)
+        return matrix
+    return build_global_prf_feature_matrix(
+        counters,
+        subcategory=state.subcategory,
+        prf_key=state.prf_key,
+        global_tags=state.global_tags,
     )
 
 
@@ -1545,17 +1643,14 @@ def logits_for_org_rows(
     feature_matrix_cache: FeatureMatrixCache | None = None,
     cache_partition: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    X = _feature_matrix_for_rows(
+    X = _global_feature_matrix_for_rows(
         state=state,
         org_position=org_position,
         row_indices=row_indices,
-        mode="tf",
         feature_matrix_cache=feature_matrix_cache,
         cache_partition=cache_partition,
     )
-    index_vector = state.org_index_vectors[org_position]
-    local_weights = state.weights[index_vector] if index_vector else state.weights[:0]
-    return X, binary_logits(X, local_weights, state.bias)
+    return X, binary_logits(X, state.weights, state.bias)
 
 
 def collect_logits_for_rows(
@@ -1656,15 +1751,29 @@ def top_contributions(
     state: SpecialistState,
     org_position: int,
     feature_row: Any,
+    row_token_counter: Mapping[str, int] | None,
     debug_plaintext_vocab: bool,
     limit: int = 5,
 ) -> list[dict[str, Any]]:
-    vocab_tokens = state.org_vocab_tokens[org_position]
-    index_vector = state.org_index_vectors[org_position]
-    tags = state.org_tag_lists[org_position]
-    if not vocab_tokens:
-        return []
-    local_weights = state.weights[index_vector] if index_vector else state.weights[:0]
+    del org_position  # Contributions are expressed directly in global coordinates.
+    plaintext_by_global_index: dict[int, str] = {}
+    if debug_plaintext_vocab and row_token_counter:
+        tokens = sorted(
+            token for token, count in row_token_counter.items() if count != 0
+        )
+        tags = tag_namespaced_vocabulary(
+            tokens,
+            state.prf_key,
+            subcategory=state.subcategory,
+        )
+        global_tag_to_index = {
+            tag: index for index, tag in enumerate(state.global_tags)
+        }
+        for token, tag in zip(tokens, tags):
+            global_index = global_tag_to_index.get(tag)
+            if global_index is not None:
+                plaintext_by_global_index.setdefault(global_index, token)
+
     candidates: list[dict[str, Any]] = []
     if sparse.issparse(feature_row):
         row = feature_row.tocsr()
@@ -1674,17 +1783,17 @@ def top_contributions(
         dense_row = np.asarray(feature_row).ravel()
         indices = np.flatnonzero(dense_row)
         values = dense_row[indices]
-    for local_index, feature_value in zip(indices, values):
-        contribution = float(feature_value) * float(local_weights[local_index])
+    for global_index, feature_value in zip(indices, values):
+        contribution = float(feature_value) * float(state.weights[global_index])
         item: dict[str, Any] = {
-            "tag": tags[local_index],
-            "gv_index": int(index_vector[local_index]),
+            "tag": state.global_tags[global_index],
+            "gv_index": int(global_index),
             "feature_value": float(feature_value),
-            "weight": float(local_weights[local_index]),
+            "weight": float(state.weights[global_index]),
             "contribution": float(contribution),
         }
-        if debug_plaintext_vocab:
-            item["token"] = vocab_tokens[local_index]
+        if debug_plaintext_vocab and global_index in plaintext_by_global_index:
+            item["token"] = plaintext_by_global_index[global_index]
         candidates.append(item)
     candidates.sort(key=lambda item: (-abs(item["contribution"]), item["tag"]))
     for rank, item in enumerate(candidates[:limit], start=1):
@@ -1748,6 +1857,9 @@ def generate_hierarchical_predictions(
                         state=state,
                         org_position=org_position,
                         feature_row=X_row[0],
+                        row_token_counter=(
+                            state.org_token_counters[org_position][row_index]
+                        ),
                         debug_plaintext_vocab=debug_plaintext_vocab,
                     )
             record: dict[str, Any] = {

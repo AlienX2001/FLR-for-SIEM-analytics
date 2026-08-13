@@ -20,6 +20,7 @@ from sklearn.metrics import (
 from federated_lr_pipeline.config import PipelineConfig
 from federated_lr_pipeline.data import OrgDataset, load_all_orgs
 from federated_lr_pipeline.ensemble import ManualLogitFusion, fused_probabilities
+from federated_lr_pipeline.prf import derive_prf_key
 from federated_lr_pipeline.specialized_models import (
     SpecialistState,
     build_subcategory_token_counters,
@@ -283,6 +284,7 @@ def _load_specialist_state(
     org_datasets: list[OrgDataset],
     org_texts: list[list[str]],
     org_token_counters: list[list[Any]],
+    prf_key: bytes,
 ) -> SpecialistState:
     prefix = _state_prefix(label, subcategory)
     global_tags_path = _manifest_entry_path(
@@ -398,6 +400,7 @@ def _load_specialist_state(
         weights=weights,
         bias=float(bias_values[0]),
         missing_columns_by_org=missing_columns_by_org,
+        prf_key=prf_key,
     )
 
 
@@ -496,6 +499,20 @@ def load_testing_artifacts(
     run_config = dict(_read_json(run_config_path))
     label_classes = _load_label_classes(label_classes_path)
     manifest = dict(_read_json(manifest_path))
+    prf_namespace = run_config.get("prf_namespace")
+    if not isinstance(prf_namespace, dict) or prf_namespace.get("format") != (
+        "subcategory|token"
+    ):
+        raise ValueError(
+            "Testing artifacts use an unsupported PRF namespace. Retrain with "
+            "prf_namespace.format='subcategory|token' before global OOV inference."
+        )
+    if "seed" not in run_config:
+        raise ValueError(
+            "run_config.json is missing the training seed required for local PRF "
+            "projection"
+        )
+    prf_key = derive_prf_key(int(run_config["seed"]))
 
     fusion_path = _resolve_artifact(
         artifact_dir=artifact_dir,
@@ -591,6 +608,7 @@ def load_testing_artifacts(
                 org_datasets=org_datasets,
                 org_texts=texts_by_subcategory[subcategory],
                 org_token_counters=token_counters_by_subcategory[subcategory],
+                prf_key=prf_key,
             )
 
     validate_testing_artifacts(
@@ -710,6 +728,9 @@ def run_testing_inference(
                         state=state,
                         org_position=org_position,
                         feature_row=X_row[0],
+                        row_token_counter=(
+                            state.org_token_counters[org_position][row_index]
+                        ),
                         debug_plaintext_vocab=debug_plaintext_vocab,
                     )
             record: dict[str, Any] = {

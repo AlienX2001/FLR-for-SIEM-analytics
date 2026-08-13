@@ -80,6 +80,27 @@ GV[label][subcategory] = sorted union of tags
 
 Plaintext tokens are not needed by the global vocabulary builder. Use `--debug-plaintext-vocab` only for local debugging and explanation inspection.
 
+### Global Inference Projection
+
+Local vocabularies constrain federated training updates, but they do not constrain
+inference coverage. During inference, the local SIEM tokenizes every query row,
+computes `PRF(subcategory|token)` for every observed token, and projects matching
+tags directly into the complete global vocabulary. A token learned from another
+organization can therefore contribute to the current organization's prediction
+even when it was absent from the current organization's training-time LV.
+
+The projected matrix is sparse and is built once per organization/subcategory,
+then reused across label specialists on the shared subcategory axis. Tokens whose
+tags are absent from the global vocabulary are ignored because the federated model
+has no trained coefficient for them. Global weights are stored in TF coordinates,
+so inference does not fit or transmit query-time IDF statistics.
+
+Testing mode derives the prototype PRF key from the saved training seed and
+requires `prf_namespace.format` to be `subcategory|token`. The PRF operation is
+performed locally; plaintext query tokens are not required by the server. In a
+production deployment, key derivation from a public run seed should be replaced
+with a protected local PRF service.
+
 ## Cross Features
 
 Cross-category features use a fixed vocabulary before training. Examples:
