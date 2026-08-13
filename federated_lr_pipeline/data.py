@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,48 @@ import pandas as pd
 TEXT_COLUMN_CANDIDATES = ("message", "log", "raw_log", "text")
 SOURCE_ID_CANDIDATES = ("log_id", "logid", "event_id", "id")
 ALL_COLUMNS_TEXT = "__all_columns__"
+NUMERIC_LOG_COLUMNS = frozenset(
+    {
+        "event_time_epoch",
+        "process_pid",
+        "process_ppid",
+        "process_tgid",
+        "src_port",
+        "dst_port",
+        "local_port",
+        "remote_port",
+        "protocol_number",
+        "flow_duration",
+        "duration",
+        "rate",
+        "srate",
+        "drate",
+        "header_length",
+        "total_size",
+        "total_sum",
+        "packet_number",
+        "iat",
+        "tcp_fin",
+        "tcp_syn",
+        "tcp_rst",
+        "tcp_psh",
+        "tcp_ack",
+        "tcp_urg",
+        "tcp_ece",
+        "tcp_cwr",
+        "ack_count",
+        "syn_count",
+        "fin_count",
+        "urg_count",
+        "rst_count",
+        "protocol_http",
+        "protocol_https",
+        "protocol_dns",
+        "protocol_tcp",
+        "protocol_udp",
+        "protocol_icmp",
+    }
+)
 
 
 @dataclass
@@ -77,6 +120,48 @@ def build_texts_from_logs(logs_df: pd.DataFrame, text_columns: list[str]) -> lis
     return text_rows
 
 
+def _canonical_numeric_value(value: Any, *, column: str, row_index: int) -> Any:
+    if pd.isna(value) or str(value).strip() == "":
+        return pd.NA
+    text = str(value).strip()
+    try:
+        numeric = Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError(
+            f"Numeric log column {column!r} contains invalid value {text!r} "
+            f"at row {row_index}"
+        ) from exc
+    if not numeric.is_finite():
+        raise ValueError(
+            f"Numeric log column {column!r} contains non-finite value {text!r} "
+            f"at row {row_index}"
+        )
+    if numeric == numeric.to_integral_value():
+        return int(numeric)
+    return float(numeric)
+
+
+def read_log_csv(path: str | Path) -> pd.DataFrame:
+    """Load logs with stable string fields and lossless numeric canonicalization."""
+    frame = pd.read_csv(path, dtype=str)
+    for column in NUMERIC_LOG_COLUMNS.intersection(frame.columns):
+        frame[column] = pd.Series(
+            (
+                _canonical_numeric_value(value, column=column, row_index=row_index)
+                for row_index, value in enumerate(frame[column])
+            ),
+            index=frame.index,
+            dtype=object,
+        )
+    return frame
+
+
+def normalize_label(value: Any) -> str:
+    if pd.isna(value) or not str(value).strip():
+        raise ValueError("Groundtruth labels must be nonempty")
+    return str(value).strip().lower()
+
+
 def detect_label_column(groundtruth_df: pd.DataFrame, requested: str | None = None) -> str:
     if requested is not None:
         if requested not in groundtruth_df.columns:
@@ -111,8 +196,8 @@ def load_org_dataset(
 ) -> OrgDataset:
     log_path = Path(log_path)
     groundtruth_path = Path(groundtruth_path)
-    logs_df = pd.read_csv(log_path)
-    groundtruth_df = pd.read_csv(groundtruth_path)
+    logs_df = read_log_csv(log_path)
+    groundtruth_df = pd.read_csv(groundtruth_path, dtype=str)
 
     if len(logs_df) != len(groundtruth_df):
         raise ValueError(
@@ -127,7 +212,7 @@ def load_org_dataset(
     source_id_column = detect_source_log_id_column(logs_df)
 
     texts = build_texts_from_logs(logs_df, resolved_text_columns)
-    labels = groundtruth_df[resolved_label_column].tolist()
+    labels = [normalize_label(value) for value in groundtruth_df[resolved_label_column]]
     row_indices = list(range(len(logs_df)))
     internal_ids = [f"org_{org_index}_row_{row_index}" for row_index in row_indices]
 

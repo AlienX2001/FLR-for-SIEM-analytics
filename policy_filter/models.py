@@ -84,6 +84,7 @@ class MatchResult:
     reason_code: str
     reason_details: str
     matched_policy_id: str | None = None
+    match_depth: int = 0
 
 
 @dataclass(frozen=True)

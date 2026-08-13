@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 from federated_lr_pipeline.data import load_org_dataset
+from federated_lr_pipeline.feature_schemas import NETWORK_ATTRIBUTES
 from federated_lr_pipeline.specialized_models import (
     build_specialized_texts_for_org,
     field_aware_tokens,
@@ -84,3 +85,9 @@ def test_missing_columns_are_reported_gracefully(tmp_path: Path) -> None:
 
     assert texts == ["protocol_name=udp"]
     assert missing == ["dst_port", "protocol_dns"]
+
+
+def test_remnant_label_columns_are_not_model_attributes() -> None:
+    assert "label" not in NETWORK_ATTRIBUTES
+    assert "sub_label" not in NETWORK_ATTRIBUTES
+    assert "sub_label_cat" not in NETWORK_ATTRIBUTES

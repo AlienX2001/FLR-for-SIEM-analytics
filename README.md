@@ -105,13 +105,24 @@ with a protected local PRF service.
 
 Cross-category features use a fixed vocabulary before training. Examples:
 
-- `cross:sensitive_file_read_AND_large_upload_same_host_15m`
-- `cross:encoded_command_AND_first_seen_domain_same_host_15m`
-- `cross:llm_file_read_tool_AND_system_sensitive_file_read_same_user_15m`
-- `cross:failed_login_burst_AND_successful_login_same_user_15m`
-- `cross:secret_read_tool_AND_external_post_same_user_15m`
+- `cross:sensitive_file_read_and_large_upload_same_host_15m`
+- `cross:encoded_command_and_first_seen_domain_same_host_15m`
+- `cross:llm_file_read_tool_and_system_sensitive_file_read_same_user_15m`
+- `cross:failed_login_burst_and_successful_login_same_user_15m`
+- `cross:secret_read_tool_and_external_post_same_user_15m`
 
 These features are generated from primitive signals before training and are PRF-tagged with the `cross|token` namespace.
+
+Cross vocabulary version 2 contains exactly 1,000 canonical lowercase tokens:
+five left-side signals, 20 prioritized right-side signals, and 10 broadly
+available entity scopes. Each left-side signal therefore receives 200 complete
+features. Every organization receives the complete fixed cross vocabulary, so
+`|LV_i| = |GV| = 1000`; each `pi_i` maps local list order to sorted global PRF-tag
+order. The vocabulary size is independent of `--num-features`.
+
+The run configuration and specialist manifest store the cross-vocabulary version,
+size, canonicalization, and SHA-256 checksum. Testing rejects incompatible
+artifacts. Version 1 artifacts used uppercase `_AND_` tokens and must be retrained.
 
 Global specialist weights are maintained in TF coordinates. During round 0, each
 organization computes IDF locally, converts incoming TF weights to equivalent
@@ -127,11 +138,19 @@ IP, session, or process tree, the extractor retains primitive signals from the
 current event and preceding 15 minutes. A cross token is emitted on the event that
 completes the configured signal pair. The upper boundary is inclusive.
 
+During training, each organization builds a novelty baseline from only the benign
+rows in its training split. Domains, TLS SNI values, and destination IP addresses
+are canonicalized and stored as HMAC tags in `benign_novelty_baselines.json`;
+plaintext values are not written to the artifact. The `first_seen_domain`,
+`new_tls_sni`, `rare_destination_ip`, and novelty-dependent `external_post`
+signals fire only when the observed value is absent from that organization's
+saved benign baseline. Held-out rows and non-benign rows never populate it.
+
 For example, a failed login at `10:00` followed by a successful login for the same
 user at `10:05` can activate:
 
 ```text
-cross:failed_login_burst_AND_successful_login_same_user_15m
+cross:failed_login_burst_and_successful_login_same_user_15m
 ```
 
 The same events for different users do not correlate. Context is never shared
@@ -139,6 +158,11 @@ between organizations. Invalid, missing, or conflicting timestamps fall back to
 single-row cross evidence for that row and never borrow context from another row.
 The extractor is causal and does not inspect events later than the event being
 scored.
+
+Network-zone scope uses explicit zone values when available. Otherwise it parses
+plain IPs, IP/port endpoints, bracketed IPv6 endpoints, and common source,
+destination, local, and remote address fields. It derives IPv4 `/24` and IPv6
+`/64` zones without DNS or other network lookups.
 
 The context window is independent of `--batch-size`, which controls local LR
 training updates only. The fixed vocabulary currently supports `15` minutes. Use
@@ -164,6 +188,16 @@ internal_log_id = org_{org_index}_row_{row_index}
 
 If a source `log_id`-like column exists, it is preserved as metadata only.
 
+Groundtruth labels are trimmed and lowercased before encoding. The raw data
+columns `label`, `sub_label`, and `sub_label_cat` are excluded from specialist
+feature schemas: inspection of the supplied CICAPT-IIoT data found sparse direct
+attack names in those fields, so retaining them would leak the target. Configured
+numeric telemetry fields are parsed numerically; integral values remain integers,
+while fractional timestamps, rates, durations, and IAT values remain floating
+point to avoid destructive truncation. Identity fields such as `user_uid`,
+`user_euid`, `group_gid`, and `group_egid` remain strings so formatting and leading
+zeros are preserved. All other raw fields remain strings.
+
 ## Example Commands
 
 Running LR training:
@@ -172,6 +206,7 @@ Running LR training:
 conda run -n LR python -m federated_lr_pipeline.run \
   --org-data examples/orgA_logs.csv examples/orgB_logs.csv examples/orgC_logs.csv \
   --org-groundtruth examples/orgA_groundtruth.csv examples/orgB_groundtruth.csv examples/orgC_groundtruth.csv \
+  --label-column "Tactic Name" \
   --num-features 20 \
   --federation-iterations 5 \
   --min-df 1 \
@@ -211,12 +246,13 @@ conda run -n LR python -m federated_lr_pipeline.run \
   --testing \
   --org-data examples/orgA_logs.csv examples/orgB_logs.csv examples/orgC_logs.csv \
   --org-groundtruth examples/orgA_groundtruth.csv examples/orgB_groundtruth.csv examples/orgC_groundtruth.csv \
+  --label-column "Tactic Name" \
   --model-artifact-dir outputs/run_001 \
   --risk-threshold 0.5 \
   --output-dir outputs/test_run_001
 ```
 
-Testing mode loads saved specialist weights, global PRF-tag vocabularies, per-organization index vectors, label classes, fusion metadata, and the training-time cross-context settings. It does not regenerate vocabularies, train local models, aggregate parameters, initialize new models, or write new trained weights. Testing from raw logs requires saved local vocabulary tokens; run the training job with `--debug-plaintext-vocab` when you need later standalone testing from CSV inputs. Artifacts created before `cross_context` metadata was introduced retain legacy row-local cross extraction during testing.
+Testing mode loads saved specialist weights, global PRF-tag vocabularies, per-organization index vectors, label classes, fusion metadata, benign novelty baselines, and the training-time cross-context settings. It does not regenerate vocabularies, train local models, aggregate parameters, initialize new models, or write new trained weights. Testing from raw logs requires saved local vocabulary tokens; run the training job with `--debug-plaintext-vocab` when you need later standalone testing from CSV inputs. When the hierarchy uses cross specialists, testing rejects older artifact directories that do not contain compatible cross-context and benign-baseline metadata because their features cannot be reproduced exactly.
 
 ## Output Files
 
@@ -227,6 +263,7 @@ LR training outputs:
 - `hierarchical_model_manifest.json`
 - `manual_logit_fusion.json`
 - `label_encoder_classes.json`
+- `benign_novelty_baselines.json`
 - `training_metrics.json`
 - `predictions.csv`
 - `predictions.jsonl`
@@ -259,3 +296,8 @@ IoC-generation writes:
 - `ioc_bundle.json`
 - `ioc_records.jsonl`
 - `ioc_summary.csv`
+
+IoC extraction prioritizes populated structured indicator fields such as source
+and destination IPs, domains, SNI, URLs, and hashes. It scans the configured free
+text column only when none of those structured fields is populated, preventing a
+duplicated narrative field from overriding authoritative structured values.

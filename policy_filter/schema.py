@@ -145,6 +145,31 @@ def _fail(path: str, message: str) -> PolicyValidationError:
     return PolicyValidationError(f"{path}: {message}")
 
 
+def _parse_preprocessing(value: Any, errors: list[str]) -> dict[str, Any]:
+    mapping = _as_dict(value, "preprocessing")
+    for key in sorted(set(mapping) - SUPPORTED_PREPROCESSING_OPTIONS):
+        errors.append(f"preprocessing.{key}: unsupported preprocessing option")
+
+    text_column = mapping.get("text_column")
+    if text_column is not None and (
+        not isinstance(text_column, str) or not text_column.strip()
+    ):
+        errors.append("preprocessing.text_column: expected null or a nonempty string")
+    include_cross_category = mapping.get("include_cross_category", True)
+    if not isinstance(include_cross_category, bool):
+        errors.append("preprocessing.include_cross_category: expected a boolean")
+        include_cross_category = True
+    preserve_empty_fields = mapping.get("preserve_empty_fields", False)
+    if not isinstance(preserve_empty_fields, bool):
+        errors.append("preprocessing.preserve_empty_fields: expected a boolean")
+        preserve_empty_fields = False
+    return {
+        "text_column": text_column.strip() if isinstance(text_column, str) else None,
+        "include_cross_category": include_cross_category,
+        "preserve_empty_fields": preserve_empty_fields,
+    }
+
+
 def _warn_or_raise(
     *,
     strict: bool,
@@ -794,9 +819,7 @@ def load_policy(path: str | Path, *, strict: bool = False) -> PolicyDocument:
 
     default_timezone = str(raw.get("default_timezone") or "UTC")
     _validate_timezone(default_timezone, "default_timezone")
-    preprocessing = _as_dict(raw.get("preprocessing"), "preprocessing")
-    for key in sorted(set(preprocessing) - SUPPORTED_PREPROCESSING_OPTIONS):
-        errors.append(f"preprocessing.{key}: unsupported preprocessing option")
+    preprocessing = _parse_preprocessing(raw.get("preprocessing"), errors)
 
     field_mapping_payload = _as_dict(raw.get("field_mappings"), "field_mappings")
     field_mappings = {

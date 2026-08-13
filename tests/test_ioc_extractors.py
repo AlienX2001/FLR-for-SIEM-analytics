@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from ioc_generation.extractors import extract_iocs
+from ioc_generation.normalize import normalize_log_row
+import pandas as pd
 
 
 def test_extracts_ips_domains_urls_and_hashes() -> None:
@@ -51,3 +53,27 @@ def test_does_not_extract_iocs_from_url_paths() -> None:
     assert ("domain", "300x168.jpg") not in extracted
     assert ("ipv4", "200.98.142.12") in extracted
     assert ("ipv4", "1.0.0.0") not in extracted
+
+
+def test_structured_ioc_fields_take_priority_over_free_text() -> None:
+    row = pd.Series(
+        {
+            "src_ip": "192.0.2.10",
+            "message": "callback to https://evil.example/path",
+        }
+    )
+
+    normalized = normalize_log_row(row, "message")
+    extracted = {(item.indicator_type, item.value) for item in extract_iocs(normalized)}
+
+    assert ("ipv4", "192.0.2.10") in extracted
+    assert ("domain", "evil.example") not in extracted
+
+
+def test_text_is_used_when_structured_ioc_fields_are_empty() -> None:
+    row = pd.Series({"src_ip": "", "message": "https://evil.example/path"})
+
+    normalized = normalize_log_row(row, "message")
+    extracted = {(item.indicator_type, item.value) for item in extract_iocs(normalized)}
+
+    assert ("url", "https://evil.example/path") in extracted

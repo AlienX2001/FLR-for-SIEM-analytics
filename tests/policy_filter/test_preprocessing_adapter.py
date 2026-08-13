@@ -73,3 +73,22 @@ def test_canonical_values_drive_matching_but_raw_values_are_separate(tmp_path: P
 
     assert adapted.canonical_fields["program"] == "curl"
     assert adapted.resolved_fields["program"].original_value == "Curl"
+
+
+def test_configured_preprocessing_options_are_applied(tmp_path: Path) -> None:
+    payload = parity_policy()
+    payload["preprocessing"] = {
+        "text_column": "message",
+        "include_cross_category": False,
+        "preserve_empty_fields": True,
+    }
+    policy = load_policy(write_policy(tmp_path, payload))
+
+    adapted = preprocess_policy_row(
+        {"message": "Administrative Notice", "process_name": ""},
+        policy,
+    )
+
+    assert "message=administrative_notice" in adapted.normalized_text
+    assert adapted.canonical_fields["program"] == ""
+    assert adapted.cross_evidence["tokens"] == ()

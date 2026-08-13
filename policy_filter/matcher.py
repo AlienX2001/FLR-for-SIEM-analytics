@@ -405,41 +405,92 @@ def _connection_matches(
         return MatchResult("NOT_ALLOWED", reasons.UNKNOWN_NETWORK_DIRECTION, "direction is missing or ambiguous")
     if connection.direction != "any" and connection.direction != direction:
         return MatchResult("NOT_ALLOWED", reasons.UNKNOWN_NETWORK_DIRECTION, "direction did not match")
+    match_depth = 1
     remote_ip = _remote_ip_for_direction(direction, row)
     remote_domain = _field(row, "domain")
-    remote_matched = False
-    if remote_ip is not None:
-        remote_matched = remote_ip in connection.remote_ips or any(
+    has_ip_condition = bool(connection.remote_ips or connection.remote_cidrs)
+    if has_ip_condition:
+        if remote_ip is None:
+            return MatchResult(
+                "NOT_ALLOWED",
+                reasons.MISSING_REQUIRED_FIELD,
+                "remote IP is required",
+                match_depth=match_depth,
+            )
+        if remote_ip not in connection.remote_ips and not any(
             remote_ip in network for network in connection.remote_cidrs
-        )
-    if not remote_matched and connection.remote_domains:
-        remote_matched = _domain_matches(remote_domain, connection.remote_domains)
-    if not remote_matched:
-        if connection.remote_domains and remote_domain:
-            return MatchResult("NOT_ALLOWED", reasons.UNAUTHORIZED_REMOTE_DOMAIN, "remote domain is not authorized")
-        if connection.remote_domains and remote_domain is None and remote_ip is None:
-            return MatchResult("NOT_ALLOWED", reasons.MISSING_REQUIRED_FIELD, "remote domain or IP is required")
-        return MatchResult("NOT_ALLOWED", reasons.UNAUTHORIZED_REMOTE_IP, "remote IP is not authorized")
+        ):
+            return MatchResult(
+                "NOT_ALLOWED",
+                reasons.UNAUTHORIZED_REMOTE_IP,
+                "remote IP is not authorized",
+                match_depth=match_depth + 1,
+            )
+        match_depth += 1
+    if connection.remote_domains:
+        if remote_domain is None:
+            return MatchResult(
+                "NOT_ALLOWED",
+                reasons.MISSING_REQUIRED_FIELD,
+                "remote domain is required",
+                match_depth=match_depth,
+            )
+        if not _domain_matches(remote_domain, connection.remote_domains):
+            return MatchResult(
+                "NOT_ALLOWED",
+                reasons.UNAUTHORIZED_REMOTE_DOMAIN,
+                "remote domain is not authorized",
+                match_depth=match_depth + 1,
+            )
+        match_depth += 1
     if connection.protocols:
         protocol = _field(row, "protocol")
         if protocol is None:
-            return MatchResult("NOT_ALLOWED", reasons.MISSING_REQUIRED_FIELD, "protocol is required")
+            return MatchResult(
+                "NOT_ALLOWED",
+                reasons.MISSING_REQUIRED_FIELD,
+                "protocol is required",
+                match_depth=match_depth,
+            )
         if protocol.lower() not in connection.protocols:
-            return MatchResult("NOT_ALLOWED", reasons.UNAUTHORIZED_PROTOCOL, "protocol is not authorized")
+            return MatchResult(
+                "NOT_ALLOWED",
+                reasons.UNAUTHORIZED_PROTOCOL,
+                "protocol is not authorized",
+                match_depth=match_depth + 1,
+            )
+        match_depth += 1
     if connection.destination_ports:
         port = _parse_port(_field(row, "destination_port"))
         if port is None:
-            return MatchResult("NOT_ALLOWED", reasons.MISSING_REQUIRED_FIELD, "destination_port is required")
+            return MatchResult(
+                "NOT_ALLOWED",
+                reasons.MISSING_REQUIRED_FIELD,
+                "destination_port is required",
+                match_depth=match_depth,
+            )
         if not any(port_matcher.contains(port) for port_matcher in connection.destination_ports):
-            return MatchResult("NOT_ALLOWED", reasons.UNAUTHORIZED_PORT, "destination port is not authorized")
+            return MatchResult(
+                "NOT_ALLOWED",
+                reasons.UNAUTHORIZED_PORT,
+                "destination port is not authorized",
+                match_depth=match_depth + 1,
+            )
+        match_depth += 1
     in_time, time_reason = _timestamp_in_windows(row, connection.authorized_time_windows, policy.default_timezone)
     if not in_time:
         return MatchResult(
             "NOT_ALLOWED",
             time_reason or reasons.OUTSIDE_AUTHORIZED_TIME,
             "connection time window did not authorize the event",
+            match_depth=match_depth,
         )
-    return MatchResult("ALLOWED", "ALLOWED", "network connection fully matched allow-list policy")
+    return MatchResult(
+        "ALLOWED",
+        "ALLOWED",
+        "network connection fully matched allow-list policy",
+        match_depth=match_depth + 1,
+    )
 
 
 def evaluate_network(row: PreprocessedPolicyRow, policy: PolicyDocument) -> MatchResult:
@@ -479,17 +530,24 @@ def evaluate_network(row: PreprocessedPolicyRow, policy: PolicyDocument) -> Matc
                 return MatchResult("ALLOWED", "ALLOWED", details, network_policy.policy_id)
             connection_failures.append(result)
         if connection_failures:
+            maximum_depth = max(
+                failure.match_depth for failure in connection_failures
+            )
             chosen = _choose_failure(
-                connection_failures,
+                [
+                    failure
+                    for failure in connection_failures
+                    if failure.match_depth == maximum_depth
+                ],
                 (
                     reasons.UNKNOWN_NETWORK_DIRECTION,
-                    reasons.MISSING_REQUIRED_FIELD,
                     reasons.INVALID_TIMESTAMP,
                     reasons.OUTSIDE_AUTHORIZED_TIME,
                     reasons.UNAUTHORIZED_PROTOCOL,
                     reasons.UNAUTHORIZED_PORT,
                     reasons.UNAUTHORIZED_REMOTE_DOMAIN,
                     reasons.UNAUTHORIZED_REMOTE_IP,
+                    reasons.MISSING_REQUIRED_FIELD,
                 ),
             )
             assert chosen is not None

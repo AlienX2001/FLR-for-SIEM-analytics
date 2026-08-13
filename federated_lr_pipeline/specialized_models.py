@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import numpy as np
 import pandas as pd
@@ -23,6 +24,11 @@ from federated_lr_pipeline.data import OrgDataset
 from federated_lr_pipeline.ensemble import ManualLogitFusion, fused_probabilities
 from federated_lr_pipeline.feature_schemas import (
     CROSS_CATEGORY_TOKENS,
+    CROSS_VOCABULARY_LOCAL_EQUALS_GLOBAL,
+    CROSS_VOCABULARY_SCOPES,
+    CROSS_VOCABULARY_SHA256,
+    CROSS_VOCABULARY_SIZE,
+    CROSS_VOCABULARY_VERSION,
     SUBCATEGORY_NAMES,
     SUBCATEGORY_SCHEMAS,
 )
@@ -37,7 +43,7 @@ from federated_lr_pipeline.local_training import (
 )
 from federated_lr_pipeline.metrics import accuracy, classification_report_dict
 from federated_lr_pipeline.model import initialize_weights, observed_bounds
-from federated_lr_pipeline.prf import tag_namespaced_vocabulary
+from federated_lr_pipeline.prf import hmac_sha256_tag, tag_namespaced_vocabulary
 from federated_lr_pipeline.utils import json_default, write_json, write_jsonl
 from federated_lr_pipeline.vocab import (
     LocalVocabulary,
@@ -51,23 +57,25 @@ FeatureMatrixCache = dict[
     tuple[str, str, int, str],
     tuple[tuple[str, ...], sparse.csr_matrix],
 ]
-CROSS_TOKEN_SCOPES = (
-    "same_cloud_identity",
-    "same_service_account",
-    "same_process_tree",
-    "same_network_zone",
-    "same_parent_process",
-    "same_cloud_account",
-    "same_process_pid",
-    "same_container",
-    "same_session",
-    "same_cluster",
-    "same_entity",
-    "same_src_ip",
-    "same_dst_ip",
-    "same_host",
-    "same_user",
+CROSS_TOKEN_SCOPES = CROSS_VOCABULARY_SCOPES
+BENIGN_NOVELTY_BASELINE_VERSION = 1
+BENIGN_NOVELTY_BASELINE_FILENAME = "benign_novelty_baselines.json"
+NOVELTY_DOMAIN_COLUMNS = (
+    "domain",
+    "destination_domain",
+    "dns_query",
+    "query",
+    "http_host",
+    "hostname_query",
 )
+NOVELTY_SNI_COLUMNS = ("tls_sni", "sni")
+NOVELTY_DESTINATION_IP_COLUMNS = (
+    "dst_ip",
+    "destination_ip",
+    "remote_ip",
+    "remote_address",
+)
+TARGET_LEAKAGE_COLUMNS = frozenset({"label", "sub_label", "sub_label_cat"})
 CROSS_SCOPE_COLUMNS: dict[str, tuple[str, ...]] = {
     "same_host": ("host", "hostname", "Computer", "computer_name", "device_id"),
     "same_user": (
@@ -103,7 +111,20 @@ CROSS_SCOPE_COLUMNS: dict[str, tuple[str, ...]] = {
         "account_name",
         "cloud_identity",
     ),
-    "same_network_zone": ("network_zone", "src_ip", "dst_ip"),
+    "same_network_zone": (
+        "network_zone",
+        "src_ip",
+        "source_ip",
+        "dst_ip",
+        "destination_ip",
+        "local_ip",
+        "local_address",
+        "remote_ip",
+        "remote_address",
+        "endpoint",
+        "source_endpoint",
+        "destination_endpoint",
+    ),
     "same_process_pid": ("process_pid", "ProcessID"),
     "same_parent_process": ("process_ppid", "parent_process", "parent"),
     "same_container": ("container_id", "container_name", "pod_name"),
@@ -188,6 +209,12 @@ class _PreparedCrossEvent:
 class _CrossWindowState:
     events: deque[tuple[datetime, frozenset[str]]]
     signal_counts: Counter[str]
+
+
+@dataclass(frozen=True)
+class BenignNoveltyBaseline:
+    benign_row_count: int
+    tagged_values: dict[str, frozenset[str]]
 
 
 def _is_missing_value(value: Any) -> bool:
@@ -302,7 +329,15 @@ def _row_haystack(
     row: Mapping[str, Any] | pd.Series,
     columns: list[str] | None = None,
 ) -> str:
-    selected_columns = columns if columns is not None else _row_columns(row)
+    selected_columns = (
+        columns
+        if columns is not None
+        else [
+            column
+            for column in _row_columns(row)
+            if str(column).lower() not in TARGET_LEAKAGE_COLUMNS
+        ]
+    )
     return " ".join(
         str(_row_get(row, column)).lower()
         for column in selected_columns
@@ -360,6 +395,34 @@ def _ip_value(value: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address | Non
         return None
 
 
+def _endpoint_ip_value(
+    value: Any,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Extract an IP without resolving hostnames or guessing nonnumeric ports."""
+    parsed = _ip_value(value)
+    if parsed is not None:
+        return parsed
+    if _is_missing_value(value):
+        return None
+
+    text = str(value).strip()
+    if "/" in text:
+        try:
+            return ipaddress.ip_interface(text).ip
+        except ValueError:
+            pass
+    if "://" in text:
+        hostname = urlsplit(text).hostname
+        return _ip_value(hostname) if hostname is not None else None
+    if text.startswith("[") and "]" in text:
+        return _ip_value(text[1 : text.index("]")])
+    if text.count(":") == 1:
+        host, port = text.rsplit(":", maxsplit=1)
+        if port.isdigit():
+            return _ip_value(host)
+    return None
+
+
 def _has_external_ip(row: Mapping[str, Any] | pd.Series, columns: list[str]) -> bool:
     for column in columns:
         if not _row_has(row, column):
@@ -384,6 +447,165 @@ def _domain_values(row: Mapping[str, Any] | pd.Series) -> list[str]:
         if _row_has(row, column) and not _is_missing_value(_row_get(row, column)):
             values.append(str(_row_get(row, column)).strip().lower().rstrip("."))
     return values
+
+
+def _canonical_domain_value(value: Any) -> str | None:
+    if _is_missing_value(value):
+        return None
+    text = str(value).strip().lower().rstrip(".")
+    if "://" in text:
+        text = (urlsplit(text).hostname or "").strip("[]").lower().rstrip(".")
+    return text or None
+
+
+def _values_from_columns(
+    row: Mapping[str, Any] | pd.Series,
+    columns: Sequence[str],
+    canonicalizer: Callable[[Any], str | None],
+) -> set[str]:
+    return {
+        canonical
+        for column in columns
+        if _row_has(row, column)
+        and (canonical := canonicalizer(_row_get(row, column))) is not None
+    }
+
+
+def _canonical_ip_value(value: Any) -> str | None:
+    parsed = _ip_value(value)
+    return parsed.compressed if parsed is not None else None
+
+
+def _novelty_values_for_row(
+    row: Mapping[str, Any] | pd.Series,
+) -> dict[str, set[str]]:
+    domains = _values_from_columns(
+        row,
+        NOVELTY_DOMAIN_COLUMNS,
+        _canonical_domain_value,
+    )
+    snis = _values_from_columns(
+        row,
+        NOVELTY_SNI_COLUMNS,
+        _canonical_domain_value,
+    )
+    destination_ips = _values_from_columns(
+        row,
+        NOVELTY_DESTINATION_IP_COLUMNS,
+        _canonical_ip_value,
+    )
+    return {
+        "domains": domains,
+        "snis": snis,
+        "destination_ips": destination_ips,
+    }
+
+
+def _novelty_tag(prf_key: bytes, kind: str, value: str) -> str:
+    return hmac_sha256_tag(prf_key, f"benign-baseline|{kind}|{value}")
+
+
+def build_benign_novelty_baselines(
+    org_datasets: list[OrgDataset],
+    splits: list[Any],
+    *,
+    prf_key: bytes,
+) -> dict[int, BenignNoveltyBaseline]:
+    baselines: dict[int, BenignNoveltyBaseline] = {}
+    for dataset, split in zip(org_datasets, splits):
+        values_by_kind: dict[str, set[str]] = {
+            "domains": set(),
+            "snis": set(),
+            "destination_ips": set(),
+        }
+        benign_row_count = 0
+        columns = list(dataset.logs_df.columns)
+        for row_index in split.train_indices:
+            if dataset.labels[int(row_index)] != "benign":
+                continue
+            benign_row_count += 1
+            values = dataset.logs_df.iloc[int(row_index)].to_dict()
+            row_values = {str(column): values[column] for column in columns}
+            for kind, observed in _novelty_values_for_row(row_values).items():
+                values_by_kind[kind].update(observed)
+        baselines[dataset.org_index] = BenignNoveltyBaseline(
+            benign_row_count=benign_row_count,
+            tagged_values={
+                kind: frozenset(
+                    _novelty_tag(prf_key, kind, value)
+                    for value in sorted(observed)
+                )
+                for kind, observed in values_by_kind.items()
+            },
+        )
+    return baselines
+
+
+def benign_novelty_baselines_to_json(
+    baselines: Mapping[int, BenignNoveltyBaseline],
+) -> dict[str, Any]:
+    return {
+        "version": BENIGN_NOVELTY_BASELINE_VERSION,
+        "organizations": {
+            str(org_index): {
+                "benign_row_count": baseline.benign_row_count,
+                "tagged_values": {
+                    kind: sorted(tags)
+                    for kind, tags in sorted(baseline.tagged_values.items())
+                },
+            }
+            for org_index, baseline in sorted(baselines.items())
+        },
+    }
+
+
+def benign_novelty_baselines_from_json(
+    payload: Mapping[str, Any],
+) -> dict[int, BenignNoveltyBaseline]:
+    if int(payload.get("version", 0)) != BENIGN_NOVELTY_BASELINE_VERSION:
+        raise ValueError(
+            "Unsupported benign novelty baseline version: "
+            f"{payload.get('version')!r}"
+        )
+    organizations = payload.get("organizations")
+    if not isinstance(organizations, Mapping):
+        raise ValueError("Benign novelty baseline organizations must be an object")
+    result: dict[int, BenignNoveltyBaseline] = {}
+    for raw_org_index, raw_baseline in organizations.items():
+        if not isinstance(raw_baseline, Mapping):
+            raise ValueError(
+                f"Benign novelty baseline for org {raw_org_index} must be an object"
+            )
+        tagged_values = raw_baseline.get("tagged_values")
+        if not isinstance(tagged_values, Mapping):
+            raise ValueError(
+                f"Benign novelty baseline for org {raw_org_index} is missing tagged_values"
+            )
+        result[int(raw_org_index)] = BenignNoveltyBaseline(
+            benign_row_count=int(raw_baseline.get("benign_row_count", 0)),
+            tagged_values={
+                str(kind): frozenset(str(tag) for tag in tags)
+                for kind, tags in tagged_values.items()
+            },
+        )
+    return result
+
+
+def _has_novel_values(
+    row: Mapping[str, Any] | pd.Series,
+    *,
+    kind: str,
+    baseline: BenignNoveltyBaseline | None,
+    prf_key: bytes | None,
+) -> bool:
+    if baseline is None or baseline.benign_row_count <= 0 or prf_key is None:
+        return False
+    observed = _novelty_values_for_row(row)[kind]
+    benign_tags = baseline.tagged_values.get(kind, frozenset())
+    return any(
+        _novelty_tag(prf_key, kind, value) not in benign_tags
+        for value in observed
+    )
 
 
 def _domain_entropy(domain: str) -> float:
@@ -418,7 +640,7 @@ def _has_successful_login(row: Mapping[str, Any] | pd.Series) -> bool:
     return (
         _value_contains(
             row,
-            ["sub_label", "sub_label_cat", "login_result", "auth_result", "event_name", "label"],
+            ["login_result", "auth_result", "event_name"],
             ["successful_login", "success", "accepted", "login_success"],
         )
         or _value_contains(row, ["EventID", "eventid", "event_id"], ["4624"])
@@ -458,7 +680,7 @@ def _cross_signal_detectors() -> dict[str, Callable[[Mapping[str, Any] | pd.Seri
         return (
             _value_contains(
                 row,
-                ["sub_label", "sub_label_cat", "process_command_line", "label", "login_result", "event_name"],
+                ["process_command_line", "login_result", "event_name"],
                 ["failed_login", "bruteforce", "failed login", "login_failed", "failure", "denied"],
             )
             or _numeric_max(row, ["failed_login_count", "auth_failure_count", "failure_count"]) >= 5
@@ -671,18 +893,31 @@ def _parse_cross_token(token: str) -> tuple[str, str, str] | None:
         if not body.endswith(suffix):
             continue
         pair = body[: -len(suffix)]
-        if "_AND_" not in pair:
+        if "_and_" not in pair:
             return None
-        left, right = pair.split("_AND_", maxsplit=1)
+        left, right = pair.split("_and_", maxsplit=1)
         return left, right, scope
     return None
 
 
 CROSS_SIGNAL_DETECTORS = _cross_signal_detectors()
+NOVELTY_SIGNAL_NAMES = frozenset(
+    {
+        "external_post",
+        "first_seen_domain",
+        "rare_destination_ip",
+        "new_tls_sni",
+    }
+)
 CROSS_TOKEN_SPECS = tuple(
     (token, parsed[0], parsed[1], parsed[2])
     for token in CROSS_CATEGORY_TOKENS
     if (parsed := _parse_cross_token(token)) is not None
+)
+CROSS_ACTIVE_SIGNAL_NAMES = frozenset(
+    signal
+    for _, left_signal, right_signal, _ in CROSS_TOKEN_SPECS
+    for signal in (left_signal, right_signal)
 )
 CROSS_TOKEN_BY_SPEC = {
     (scope, left_signal, right_signal): token
@@ -691,6 +926,60 @@ CROSS_TOKEN_BY_SPEC = {
 CROSS_TOKEN_ORDER = {
     token: index for index, token in enumerate(CROSS_CATEGORY_TOKENS)
 }
+
+
+def _novelty_signal_detected(
+    signal: str,
+    row: Mapping[str, Any] | pd.Series,
+    *,
+    baseline: BenignNoveltyBaseline | None,
+    prf_key: bytes | None,
+) -> bool:
+    if signal == "first_seen_domain":
+        return _has_novel_values(
+            row,
+            kind="domains",
+            baseline=baseline,
+            prf_key=prf_key,
+        )
+    if signal == "rare_destination_ip":
+        return _has_external_ip(row, list(NOVELTY_DESTINATION_IP_COLUMNS)) and (
+            _has_novel_values(
+                row,
+                kind="destination_ips",
+                baseline=baseline,
+                prf_key=prf_key,
+            )
+        )
+    if signal == "new_tls_sni":
+        return _has_novel_values(
+            row,
+            kind="snis",
+            baseline=baseline,
+            prf_key=prf_key,
+        )
+    if signal == "external_post":
+        has_post_or_upload = _value_contains_anywhere(
+            row,
+            [
+                "external_post",
+                "http_method=post",
+                "method=post",
+                "post ",
+                "upload",
+                " put ",
+            ],
+        )
+        return has_post_or_upload and any(
+            _has_novel_values(
+                row,
+                kind=kind,
+                baseline=baseline,
+                prf_key=prf_key,
+            )
+            for kind in ("domains", "snis", "destination_ips")
+        )
+    raise ValueError(f"Unsupported novelty signal: {signal}")
 
 
 def _parse_epoch_timestamp(value: Any) -> datetime | None:
@@ -779,7 +1068,40 @@ def _scope_values_for_row(
     row: Mapping[str, Any] | pd.Series,
 ) -> dict[str, frozenset[str]]:
     result: dict[str, frozenset[str]] = {}
-    for scope, columns in CROSS_SCOPE_COLUMNS.items():
+    for scope in CROSS_TOKEN_SCOPES:
+        if scope == "same_network_zone":
+            zones: set[str] = set()
+            for column in CROSS_SCOPE_COLUMNS[scope]:
+                if not _row_has(row, column):
+                    continue
+                raw_value = _row_get(row, column)
+                if column == "network_zone":
+                    canonical_zone = _canonical_scope_value(raw_value)
+                    if canonical_zone is not None:
+                        try:
+                            zones.add(
+                                ipaddress.ip_network(
+                                    canonical_zone,
+                                    strict=False,
+                                ).with_prefixlen
+                            )
+                        except ValueError:
+                            zones.add(f"name:{canonical_zone}")
+                        continue
+                address = _endpoint_ip_value(raw_value)
+                if address is None:
+                    continue
+                prefix_length = 24 if address.version == 4 else 64
+                zones.add(
+                    ipaddress.ip_network(
+                        f"{address.compressed}/{prefix_length}",
+                        strict=False,
+                    ).with_prefixlen
+                )
+            if zones:
+                result[scope] = frozenset(zones)
+            continue
+        columns = CROSS_SCOPE_COLUMNS[scope]
         values = {
             normalized
             for column in columns
@@ -793,11 +1115,23 @@ def _scope_values_for_row(
 
 def _active_cross_signals(
     row: Mapping[str, Any] | pd.Series,
+    *,
+    benign_novelty_baseline: BenignNoveltyBaseline | None = None,
+    prf_key: bytes | None = None,
 ) -> frozenset[str]:
     return frozenset(
         signal
-        for signal, detector in CROSS_SIGNAL_DETECTORS.items()
-        if detector(row)
+        for signal in CROSS_ACTIVE_SIGNAL_NAMES
+        if (
+            _novelty_signal_detected(
+                signal,
+                row,
+                baseline=benign_novelty_baseline,
+                prf_key=prf_key,
+            )
+            if signal in NOVELTY_SIGNAL_NAMES
+            else CROSS_SIGNAL_DETECTORS[signal](row)
+        )
     )
 
 
@@ -840,6 +1174,8 @@ def contextual_cross_tokens_for_rows(
     window_minutes: float = 15.0,
     timestamp_epoch_field: str | None = "event_time_epoch",
     timestamp_iso_field: str | None = "event_time_iso",
+    benign_novelty_baseline: BenignNoveltyBaseline | None = None,
+    prf_key: bytes | None = None,
 ) -> list[list[str]]:
     """Build causal cross-event tokens while preserving input row order.
 
@@ -848,7 +1184,14 @@ def contextual_cross_tokens_for_rows(
     the same scope value inside the inclusive rolling window.
     """
     if window_minutes <= 0:
-        return [cross_tokens_for_row(row) for row in rows]
+        return [
+            cross_tokens_for_row(
+                row,
+                benign_novelty_baseline=benign_novelty_baseline,
+                prf_key=prf_key,
+            )
+            for row in rows
+        ]
 
     prepared_events: list[_PreparedCrossEvent] = []
     timestamp_issue_counts: Counter[str] = Counter()
@@ -864,7 +1207,11 @@ def contextual_cross_tokens_for_rows(
             _PreparedCrossEvent(
                 row_index=row_index,
                 timestamp=timestamp,
-                active_signals=_active_cross_signals(row),
+                active_signals=_active_cross_signals(
+                    row,
+                    benign_novelty_baseline=benign_novelty_baseline,
+                    prf_key=prf_key,
+                ),
                 scope_values=_scope_values_for_row(row),
             )
         )
@@ -932,50 +1279,18 @@ def contextual_cross_tokens_for_rows(
     return tokens_by_row
 
 
-def cross_tokens_for_row(row: Mapping[str, Any] | pd.Series) -> list[str]:
+def cross_tokens_for_row(
+    row: Mapping[str, Any] | pd.Series,
+    *,
+    benign_novelty_baseline: BenignNoveltyBaseline | None = None,
+    prf_key: bytes | None = None,
+) -> list[str]:
     tokens: list[str] = []
-    total_size = _numeric_value(row, ["total_size", "bytes_out", "total_sum"])
-    has_sensitive_file = _value_contains(
+    active_signals = _active_cross_signals(
         row,
-        ["file_path", "process_command_line", "process_exe", "llm_tool_input"],
-        ["secret", "password", "credential", "token", "key", "sensitive"],
+        benign_novelty_baseline=benign_novelty_baseline,
+        prf_key=prf_key,
     )
-    has_external_target = any(
-        _row_has(row, column) and not _is_missing_value(_row_get(row, column))
-        for column in ["dst_ip", "remote_address", "http_host", "tls_sni"]
-    )
-    has_encoded_command = _value_contains(
-        row,
-        ["process_command_line", "process_name", "process_exe"],
-        ["encodedcommand", "base64", "powershell", "cmd.exe"],
-    )
-    has_llm_file_tool = _value_contains(
-        row,
-        ["llm_tool_name", "llm_tool_input", "tool_name", "tool_input"],
-        ["file_read", "read_file", "secret_read"],
-    )
-    has_failed_login = _value_contains(
-        row,
-        ["sub_label", "sub_label_cat", "process_command_line", "label"],
-        ["failed_login", "bruteforce", "failed login"],
-    )
-
-    if has_sensitive_file and total_size >= 5000:
-        tokens.append("cross:sensitive_file_read_AND_large_upload_same_host_15m")
-    if has_encoded_command and has_external_target:
-        tokens.append("cross:encoded_command_AND_first_seen_domain_same_host_15m")
-    if has_llm_file_tool and has_sensitive_file:
-        tokens.append("cross:llm_file_read_tool_AND_system_sensitive_file_read_same_user_15m")
-    if has_failed_login:
-        tokens.append("cross:failed_login_burst_AND_successful_login_same_user_15m")
-    if has_sensitive_file and has_external_target:
-        tokens.append("cross:secret_read_tool_AND_external_post_same_user_15m")
-
-    active_signals = {
-        signal
-        for signal, detector in CROSS_SIGNAL_DETECTORS.items()
-        if detector(row)
-    }
     active_scopes = {
         scope for scope in CROSS_TOKEN_SCOPES if _scope_supported(row, scope)
     }
@@ -995,6 +1310,8 @@ def build_cross_texts_for_org(
     context_window_minutes: float = 0.0,
     context_timestamp_epoch_field: str | None = "event_time_epoch",
     context_timestamp_iso_field: str | None = "event_time_iso",
+    benign_novelty_baseline: BenignNoveltyBaseline | None = None,
+    prf_key: bytes | None = None,
 ) -> tuple[list[str], list[str]]:
     columns = list(dataset.logs_df.columns)
     rows = (
@@ -1006,6 +1323,8 @@ def build_cross_texts_for_org(
         window_minutes=context_window_minutes,
         timestamp_epoch_field=context_timestamp_epoch_field,
         timestamp_iso_field=context_timestamp_iso_field,
+        benign_novelty_baseline=benign_novelty_baseline,
+        prf_key=prf_key,
     )
     texts = [" ".join(tokens) for tokens in token_rows]
     if context_window_minutes > 0:
@@ -1024,6 +1343,8 @@ def build_subcategory_texts(
     context_window_minutes: float = 0.0,
     context_timestamp_epoch_field: str | None = "event_time_epoch",
     context_timestamp_iso_field: str | None = "event_time_iso",
+    benign_novelty_baselines: Mapping[int, BenignNoveltyBaseline] | None = None,
+    prf_key: bytes | None = None,
 ) -> tuple[dict[str, list[list[str]]], dict[str, dict[int, list[str]]]]:
     selected_subcategories = list(subcategories) if subcategories is not None else list(SUBCATEGORY_NAMES)
     texts_by_subcategory: dict[str, list[list[str]]] = {
@@ -1042,6 +1363,12 @@ def build_subcategory_texts(
                     context_window_minutes=context_window_minutes,
                     context_timestamp_epoch_field=context_timestamp_epoch_field,
                     context_timestamp_iso_field=context_timestamp_iso_field,
+                    benign_novelty_baseline=(
+                        benign_novelty_baselines.get(dataset.org_index)
+                        if benign_novelty_baselines is not None
+                        else None
+                    ),
+                    prf_key=prf_key,
                 )
             else:
                 texts, missing = build_specialized_texts_for_org(
@@ -1905,6 +2232,19 @@ def save_hierarchical_artifacts(
                 "bias": f"final_{prefix}_bias.npy",
                 "prf_namespace": "subcategory|token",
                 "weight_coordinate_system": "tf",
+                **(
+                    {
+                        "cross_vocabulary": {
+                            "version": CROSS_VOCABULARY_VERSION,
+                            "size": CROSS_VOCABULARY_SIZE,
+                            "local_equals_global": CROSS_VOCABULARY_LOCAL_EQUALS_GLOBAL,
+                            "canonicalization": "lowercase-v1",
+                            "sha256": CROSS_VOCABULARY_SHA256,
+                        }
+                    }
+                    if subcategory == "cross"
+                    else {}
+                ),
                 "num_global_features": len(state.global_tags),
                 "missing_columns_by_org": state.missing_columns_by_org,
                 "per_org_artifacts": [],

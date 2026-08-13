@@ -5,6 +5,13 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from federated_lr_pipeline.feature_schemas import (
+    CROSS_VOCABULARY_LOCAL_EQUALS_GLOBAL,
+    CROSS_VOCABULARY_SHA256,
+    CROSS_VOCABULARY_SIZE,
+    CROSS_VOCABULARY_VERSION,
+)
+
 
 @dataclass(frozen=True)
 class PipelineConfig:
@@ -85,6 +92,13 @@ class PipelineConfig:
             "format": "subcategory|token",
         }
         payload["global_weight_coordinate_system"] = "tf"
+        payload["cross_vocabulary"] = {
+            "version": CROSS_VOCABULARY_VERSION,
+            "size": CROSS_VOCABULARY_SIZE,
+            "local_equals_global": CROSS_VOCABULARY_LOCAL_EQUALS_GLOBAL,
+            "canonicalization": "lowercase-v1",
+            "sha256": CROSS_VOCABULARY_SHA256,
+        }
         return payload
 
 

@@ -20,9 +20,18 @@ from sklearn.metrics import (
 from federated_lr_pipeline.config import PipelineConfig
 from federated_lr_pipeline.data import OrgDataset, load_all_orgs
 from federated_lr_pipeline.ensemble import ManualLogitFusion, fused_probabilities
+from federated_lr_pipeline.feature_schemas import (
+    CROSS_VOCABULARY_LOCAL_EQUALS_GLOBAL,
+    CROSS_VOCABULARY_SHA256,
+    CROSS_VOCABULARY_SIZE,
+    CROSS_VOCABULARY_VERSION,
+)
 from federated_lr_pipeline.prf import derive_prf_key
 from federated_lr_pipeline.specialized_models import (
+    BENIGN_NOVELTY_BASELINE_FILENAME,
+    BENIGN_NOVELTY_BASELINE_VERSION,
     SpecialistState,
+    benign_novelty_baselines_from_json,
     build_subcategory_token_counters,
     build_subcategory_texts,
     collect_logits_for_rows,
@@ -513,6 +522,19 @@ def load_testing_artifacts(
             "projection"
         )
     prf_key = derive_prf_key(int(run_config["seed"]))
+    expected_cross_vocabulary = {
+        "version": CROSS_VOCABULARY_VERSION,
+        "size": CROSS_VOCABULARY_SIZE,
+        "local_equals_global": CROSS_VOCABULARY_LOCAL_EQUALS_GLOBAL,
+        "canonicalization": "lowercase-v1",
+        "sha256": CROSS_VOCABULARY_SHA256,
+    }
+    if run_config.get("cross_vocabulary") != expected_cross_vocabulary:
+        raise ValueError(
+            "Testing artifacts use an incompatible cross vocabulary. Retrain with "
+            f"cross_vocabulary version {CROSS_VOCABULARY_VERSION}, size "
+            f"{CROSS_VOCABULARY_SIZE}, and lowercase-v1 canonicalization."
+        )
 
     fusion_path = _resolve_artifact(
         artifact_dir=artifact_dir,
@@ -541,6 +563,41 @@ def load_testing_artifacts(
             for subcategory in fusion.subcategories_by_label[label]
         }
     )
+    benign_novelty_baselines = {}
+    if "cross" in active_subcategories:
+        baseline_metadata = run_config.get("benign_novelty_baseline")
+        if not isinstance(baseline_metadata, dict) or int(
+            baseline_metadata.get("version", 0)
+        ) != BENIGN_NOVELTY_BASELINE_VERSION:
+            raise ValueError(
+                "Testing artifacts are missing a compatible benign novelty baseline. "
+                "Retrain the model before cross-category inference."
+            )
+        baseline_filename = str(
+            baseline_metadata.get("filename", BENIGN_NOVELTY_BASELINE_FILENAME)
+        )
+        baseline_base_dir = artifact_dir or run_config_path.parent
+        baseline_path = baseline_base_dir / baseline_filename
+        if not baseline_path.exists():
+            replacement = _prompt_for_missing_artifact(
+                "benign novelty baseline",
+                baseline_path,
+            )
+            if not replacement.exists():
+                raise FileNotFoundError(
+                    f"Provided artifact does not exist: {replacement}"
+                )
+            baseline_path = replacement
+        benign_novelty_baselines = benign_novelty_baselines_from_json(
+            _read_json(baseline_path)
+        )
+        expected_org_indices = {dataset.org_index for dataset in org_datasets}
+        if set(benign_novelty_baselines) != expected_org_indices:
+            raise ValueError(
+                "Benign novelty baseline organization indices do not match testing "
+                f"organizations: {sorted(benign_novelty_baselines)} != "
+                f"{sorted(expected_org_indices)}"
+            )
     cross_context = run_config.get("cross_context")
     if cross_context is None:
         context_window_minutes = 0.0
@@ -588,6 +645,8 @@ def load_testing_artifacts(
         context_window_minutes=context_window_minutes,
         context_timestamp_epoch_field=context_timestamp_epoch_field,
         context_timestamp_iso_field=context_timestamp_iso_field,
+        benign_novelty_baselines=benign_novelty_baselines,
+        prf_key=prf_key,
     )
     token_counters_by_subcategory = build_subcategory_token_counters(texts_by_subcategory)
     specialists: dict[str, dict[str, SpecialistState]] = {}

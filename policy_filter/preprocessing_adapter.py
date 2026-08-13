@@ -79,10 +79,18 @@ def resolve_fields(
     return resolved
 
 
-def _canonical_fields(resolved: Mapping[str, ResolvedField]) -> dict[str, str]:
+def _canonical_fields(
+    resolved: Mapping[str, ResolvedField],
+    *,
+    preserve_empty_fields: bool,
+) -> dict[str, str]:
     canonical: dict[str, str] = {}
     for logical_name, field in resolved.items():
-        if field.value is None or field.is_conflicting:
+        if field.is_conflicting:
+            continue
+        if field.value is None:
+            if preserve_empty_fields:
+                canonical[logical_name] = ""
             continue
         canonical[logical_name] = field.value
         if field.source_column:
@@ -165,10 +173,26 @@ def preprocess_policy_row(
         for logical_name, field in resolved.items()
         if field.is_conflicting
     }
-    canonical_fields = _canonical_fields(resolved)
-    normalized_text = _field_text(canonical_fields)
+    preserve_empty_fields = bool(
+        policy.preprocessing.get("preserve_empty_fields", False)
+    )
+    canonical_fields = _canonical_fields(
+        resolved,
+        preserve_empty_fields=preserve_empty_fields,
+    )
+    normalized_tokens = _field_text(canonical_fields).split()
+    text_column = policy.preprocessing.get("text_column")
+    if isinstance(text_column, str) and text_column in raw_row:
+        normalized_tokens.extend(
+            field_aware_tokens(text_column, raw_row[text_column])
+        )
+    normalized_text = " ".join(dict.fromkeys(normalized_tokens))
     counters = build_token_counters([normalized_text])[0]
-    cross_tokens = cross_tokens_for_row(canonical_fields)
+    cross_tokens = (
+        cross_tokens_for_row(canonical_fields)
+        if bool(policy.preprocessing.get("include_cross_category", True))
+        else []
+    )
     return PreprocessedPolicyRow(
         normalized_text=normalized_text,
         token_counts=counters,

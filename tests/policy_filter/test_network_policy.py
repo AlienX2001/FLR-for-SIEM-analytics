@@ -141,3 +141,24 @@ def test_adding_domain_in_yaml_changes_decision(tmp_path: Path) -> None:
         network_row(dst_ip="", domain="example.org"),
         payload,
     ).action == "suppress"
+
+
+def test_connection_with_ip_and_domain_requires_both(tmp_path: Path) -> None:
+    payload = network_policy()
+    connection = payload["network_policies"][0]["authorized_connections"][0]
+    connection["remote_domains"] = ["approved.example"]
+
+    rejected = decision_for(
+        tmp_path,
+        network_row(domain="evil.example"),
+        payload,
+    )
+    allowed = decision_for(
+        tmp_path,
+        network_row(domain="approved.example"),
+        payload,
+    )
+
+    assert rejected.action == "forward"
+    assert rejected.reason_code == "UNAUTHORIZED_REMOTE_DOMAIN"
+    assert allowed.action == "suppress"

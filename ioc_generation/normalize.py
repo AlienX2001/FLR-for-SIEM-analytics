@@ -6,6 +6,38 @@ import pandas as pd
 
 TEXT_COLUMN_CANDIDATES = ("message", "log", "raw_log", "text")
 SOURCE_ID_CANDIDATES = ("log_id", "logid", "event_id", "id")
+STRUCTURED_IOC_COLUMNS = frozenset(
+    {
+        "src_ip",
+        "source_ip",
+        "dst_ip",
+        "destination_ip",
+        "local_ip",
+        "local_address",
+        "remote_ip",
+        "remote_address",
+        "domain",
+        "destination_domain",
+        "dns_query",
+        "hostname_query",
+        "http_host",
+        "tls_sni",
+        "sni",
+        "url",
+        "uri",
+        "http_uri",
+        "download",
+        "download_url",
+        "request_url",
+        "md5",
+        "sha1",
+        "sha_1",
+        "sha256",
+        "sha_256",
+        "file_hash",
+        "hash",
+    }
+)
 
 
 def detect_text_column(df: pd.DataFrame, requested: str | None = None) -> str | None:
@@ -28,15 +60,20 @@ def detect_source_log_id_column(df: pd.DataFrame) -> str | None:
 
 
 def normalize_log_row(row: pd.Series, text_column: str | None = None) -> str:
-    if text_column is not None:
-        value = row[text_column]
-        return "" if pd.isna(value) else str(value)
-    parts: list[str] = []
+    structured_parts: list[str] = []
     for key, value in row.items():
-        if pd.isna(value):
+        normalized_key = str(key).strip().lower()
+        if normalized_key not in STRUCTURED_IOC_COLUMNS:
             continue
-        parts.append(f"{key}={value}")
-    return " ".join(parts)
+        if pd.isna(value) or not str(value).strip():
+            continue
+        structured_parts.append(f"{key}={value}")
+    if structured_parts:
+        return " ".join(structured_parts)
+    if text_column is None:
+        return ""
+    value = row[text_column]
+    return "" if pd.isna(value) else str(value)
 
 
 def source_log_id_from_row(row: pd.Series, source_column: str | None) -> Any | None:

@@ -15,6 +15,10 @@ from federated_lr_pipeline.ensemble import ManualLogitFusion
 from federated_lr_pipeline.prf import derive_prf_key
 from federated_lr_pipeline.specialized_models import (
     active_subcategories_for_hierarchy,
+    BENIGN_NOVELTY_BASELINE_FILENAME,
+    BENIGN_NOVELTY_BASELINE_VERSION,
+    benign_novelty_baselines_to_json,
+    build_benign_novelty_baselines,
     build_hierarchical_config,
     build_subcategory_token_counters,
     build_subcategory_texts,
@@ -135,6 +139,24 @@ def run_pipeline(config: PipelineConfig) -> None:
         seed=config.seed,
     )
 
+    prf_key = derive_prf_key(config.seed)
+    benign_novelty_baselines = build_benign_novelty_baselines(
+        org_datasets,
+        splits,
+        prf_key=prf_key,
+    )
+    write_json(
+        output_dir / BENIGN_NOVELTY_BASELINE_FILENAME,
+        benign_novelty_baselines_to_json(benign_novelty_baselines),
+    )
+    run_config_payload = config.to_json_dict()
+    run_config_payload["benign_novelty_baseline"] = {
+        "version": BENIGN_NOVELTY_BASELINE_VERSION,
+        "filename": BENIGN_NOVELTY_BASELINE_FILENAME,
+        "tagged": True,
+    }
+    write_json(output_dir / "run_config.json", run_config_payload)
+
     LOGGER.info("Building label-conditioned hierarchy")
     hierarchy = build_hierarchical_config(
         label_classes,
@@ -166,6 +188,8 @@ def run_pipeline(config: PipelineConfig) -> None:
         context_window_minutes=config.context_window_minutes,
         context_timestamp_epoch_field=config.context_timestamp_epoch_field,
         context_timestamp_iso_field=config.context_timestamp_iso_field,
+        benign_novelty_baselines=benign_novelty_baselines,
+        prf_key=prf_key,
     )
     token_counters_by_subcategory = build_subcategory_token_counters(texts_by_subcategory)
 
@@ -178,7 +202,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         missing_by_subcategory=missing_by_subcategory,
         splits=splits,
         config=config,
-        prf_key=derive_prf_key(config.seed),
+        prf_key=prf_key,
     )
     fusion = ManualLogitFusion(
         labels=hierarchy.labels,
