@@ -113,10 +113,11 @@ Cross-category features use a fixed vocabulary before training. Examples:
 
 These features are generated from primitive signals before training and are PRF-tagged with the `cross|token` namespace.
 
-Cross vocabulary version 2 contains exactly 1,000 canonical lowercase tokens:
-five left-side signals, 20 prioritized right-side signals, and 10 broadly
-available entity scopes. Each left-side signal therefore receives 200 complete
-features. Every organization receives the complete fixed cross vocabulary, so
+Cross vocabulary version 3 contains exactly 1,000 canonical lowercase tokens:
+10 left-side signals, 10 prioritized right-side signals, and 10 broadly
+available entity scopes. Five left-side signals represent row-level system,
+identity, and LLM behavior; five represent causal window statistics. Every
+organization receives the complete fixed cross vocabulary, so
 `|LV_i| = |GV| = 1000`; each `pi_i` maps local list order to sorted global PRF-tag
 order. The vocabulary size is independent of `--num-features`.
 
@@ -137,6 +138,29 @@ original CSV row positions. For each configured scope such as user, host, source
 IP, session, or process tree, the extractor retains primitive signals from the
 current event and preceding 15 minutes. A cross token is emitted on the event that
 completes the configured signal pair. The upper boundary is inclusive.
+
+The same causal pass augments each non-cross specialist's current-row features
+with identifier-free summaries for the inclusive
+`[event_time - 15 minutes, event_time]` window. Depending on the specialist,
+these include bucketed event and category counts, interarrival time, window span,
+distinct source/destination/port/protocol/process counts, cumulative and maximum
+size and packet counts, direction counts, authentication sequences, prior
+system/network activity, and sensitive-read/upload sequences. Scope values such
+as the actual host, user, process, or address partition local state but are never
+emitted as context tokens.
+
+Window summaries are label-independent and causal: they use no groundtruth,
+future event, prediction, or absolute timestamp value. A row receives context for
+a specialist only when that row contains native evidence for that specialist.
+Surrounding network activity therefore does not manufacture system, identity,
+LLM, or cloud coverage for a row that lacks those fields.
+
+The causal state also measures flow count, distinct destinations, distinct
+destination ports, cumulative transfer size, and repeated destinations. These
+produce fixed signals such as `window_flow_burst`, `window_destination_fanout`,
+`window_port_fanout`, `window_high_volume`, and
+`window_repeated_destination`. They are computed independently per scope and do
+not use labels, future rows, model predictions, or post-inference contributions.
 
 During training, each organization builds a novelty baseline from only the benign
 rows in its training split. Domains, TLS SNI values, and destination IP addresses
@@ -171,6 +195,23 @@ Timestamp columns default to `event_time_epoch` and `event_time_iso` and can be
 changed with `--context-timestamp-epoch-field` and
 `--context-timestamp-iso-field`.
 
+### Coverage-Aware Fusion
+
+Before label logits are fused, each specialist receives a per-row coverage flag.
+A specialist is covered only when at least one feature native to its subcategory
+is present in that specialist's global PRF vocabulary. For example, source and
+destination IPs alone count as network evidence and do not activate an identity
+or cloud specialist. Uncovered specialist logits are replaced with zero before
+manual weighting, preventing learned specialist biases from favoring labels that
+merely configure more subcategories. The final prediction remains a single-stage
+softmax over the fused label logits.
+
+Training also writes `representation_diagnostics.json`. It hashes complete
+training representations and reports how often an identical representation is
+associated with multiple labels, including a majority-label ceiling. Only hashes
+and aggregate label counts are stored; raw rows and plaintext feature values are
+not included.
+
 ## Input CSV Format
 
 Each organization provides:
@@ -194,9 +235,15 @@ feature schemas: inspection of the supplied CICAPT-IIoT data found sparse direct
 attack names in those fields, so retaining them would leak the target. Configured
 numeric telemetry fields are parsed numerically; integral values remain integers,
 while fractional timestamps, rates, durations, and IAT values remain floating
-point to avoid destructive truncation. Identity fields such as `user_uid`,
-`user_euid`, `group_gid`, and `group_egid` remain strings so formatting and leading
-zeros are preserved. All other raw fields remain strings.
+point to avoid destructive truncation. Before vocabulary construction, high-cardinality
+numeric model fields are encoded with deterministic, data-independent buckets. Ports
+use service and IANA range classes; process IDs, durations, rates, sizes, packet counts,
+and TCP counters use logarithmic magnitude intervals. Protocol numbers and binary
+protocol/TCP indicators remain exact categorical features. Identity fields such as
+`user_uid`, `user_euid`, `group_gid`, and `group_egid` remain strings so formatting and
+leading zeros are preserved. Timestamps are excluded from LR vocabularies and are used
+only to order and expire events in the causal context window. All other raw fields
+remain strings.
 
 ## Example Commands
 
@@ -264,6 +311,7 @@ LR training outputs:
 - `manual_logit_fusion.json`
 - `label_encoder_classes.json`
 - `benign_novelty_baselines.json`
+- `representation_diagnostics.json`
 - `training_metrics.json`
 - `predictions.csv`
 - `predictions.jsonl`

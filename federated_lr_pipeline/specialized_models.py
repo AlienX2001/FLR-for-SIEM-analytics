@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import ipaddress
 import json
 import logging
@@ -23,14 +24,24 @@ from federated_lr_pipeline.config import PipelineConfig
 from federated_lr_pipeline.data import OrgDataset
 from federated_lr_pipeline.ensemble import ManualLogitFusion, fused_probabilities
 from federated_lr_pipeline.feature_schemas import (
+    CONTEXT_COUNT_BUCKET_UPPER_BOUNDS,
+    CONTEXT_FEATURE_SCOPES,
+    CONTEXT_INTERVAL_BUCKET_UPPER_BOUNDS,
+    CONTEXT_MAGNITUDE_BUCKET_UPPER_BOUNDS,
+    CONTEXT_SCOPES_BY_SUBCATEGORY,
     CROSS_CATEGORY_TOKENS,
     CROSS_VOCABULARY_LOCAL_EQUALS_GLOBAL,
     CROSS_VOCABULARY_SCOPES,
     CROSS_VOCABULARY_SHA256,
     CROSS_VOCABULARY_SIZE,
     CROSS_VOCABULARY_VERSION,
+    SUBCATEGORY_COVERAGE_ATTRIBUTES,
     SUBCATEGORY_NAMES,
     SUBCATEGORY_SCHEMAS,
+)
+from federated_lr_pipeline.numeric_features import (
+    numeric_bucket_tokens,
+    numeric_bucketing_metadata,
 )
 from federated_lr_pipeline.local_training import (
     binary_logits,
@@ -76,6 +87,19 @@ NOVELTY_DESTINATION_IP_COLUMNS = (
     "remote_address",
 )
 TARGET_LEAKAGE_COLUMNS = frozenset({"label", "sub_label", "sub_label_cat"})
+CONTEXT_SOURCE_COLUMNS = (
+    "src_ip",
+    "source_ip",
+    "local_ip",
+    "local_address",
+)
+CONTEXT_PROCESS_COLUMNS = (
+    "process_name",
+    "process_exe",
+    "process_command_line",
+    "parent_process",
+)
+CONTEXT_PROTOCOL_COLUMNS = ("protocol_name", "protocol", "proto", "protocol_number")
 CROSS_SCOPE_COLUMNS: dict[str, tuple[str, ...]] = {
     "same_host": ("host", "hostname", "Computer", "computer_name", "device_id"),
     "same_user": (
@@ -146,6 +170,7 @@ class HierarchicalModelConfig:
     branches: dict[str, LabelBranchConfig]
     fusion: str = "logit"
     fusion_mode: str = "manual"
+    coverage_aware: bool = True
 
 
 @dataclass
@@ -203,12 +228,53 @@ class _PreparedCrossEvent:
     timestamp: datetime | None
     active_signals: frozenset[str]
     scope_values: dict[str, frozenset[str]]
+    window_observation: _CrossWindowObservation
+
+
+@dataclass(frozen=True)
+class _CrossWindowObservation:
+    sources: frozenset[str]
+    destinations: frozenset[str]
+    source_ports: frozenset[int]
+    destination_ports: frozenset[int]
+    protocols: frozenset[str]
+    processes: frozenset[str]
+    total_size: float
+    packet_count: float
+    categories: frozenset[str]
+    direction: str | None
+    failed_login: bool
+    successful_login: bool
+    sensitive_read: bool
+    large_upload: bool
 
 
 @dataclass
 class _CrossWindowState:
-    events: deque[tuple[datetime, frozenset[str]]]
+    events: deque[tuple[datetime, frozenset[str], _CrossWindowObservation]]
     signal_counts: Counter[str]
+    source_counts: Counter[str]
+    destination_counts: Counter[str]
+    source_port_counts: Counter[int]
+    destination_port_counts: Counter[int]
+    protocol_counts: Counter[str]
+    process_counts: Counter[str]
+    category_counts: Counter[str]
+    direction_counts: Counter[str]
+    size_bucket_counts: Counter[int]
+    packet_bucket_counts: Counter[int]
+    failed_login_count: int = 0
+    successful_login_count: int = 0
+    sensitive_read_count: int = 0
+    large_upload_count: int = 0
+    total_size: float = 0.0
+    total_packets: float = 0.0
+
+
+@dataclass(frozen=True)
+class ContextualFeatureRows:
+    cross_tokens: list[list[str]]
+    specialist_tokens: dict[str, list[list[str]]]
 
 
 @dataclass(frozen=True)
@@ -250,6 +316,9 @@ def field_aware_tokens(column_name: str, value: Any) -> list[str]:
     if _is_missing_value(value):
         return []
     field = _field_name(column_name)
+    bucket_tokens = numeric_bucket_tokens(field, value)
+    if bucket_tokens is not None:
+        return bucket_tokens
     value_text = _field_value(value)
     if not value_text:
         return []
@@ -919,6 +988,29 @@ CROSS_ACTIVE_SIGNAL_NAMES = frozenset(
     for _, left_signal, right_signal, _ in CROSS_TOKEN_SPECS
     for signal in (left_signal, right_signal)
 )
+WINDOW_SIGNAL_NAMES = frozenset(
+    signal
+    for signal in CROSS_ACTIVE_SIGNAL_NAMES
+    if signal.startswith("window_")
+)
+ROW_CROSS_SIGNAL_NAMES = CROSS_ACTIVE_SIGNAL_NAMES - WINDOW_SIGNAL_NAMES
+WINDOW_AGGREGATION_SCOPES = frozenset(
+    {
+        "same_host",
+        "same_user",
+        "same_session",
+        "same_process_tree",
+        "same_src_ip",
+        "same_entity",
+        "same_process_pid",
+        "same_parent_process",
+    }
+)
+WINDOW_FLOW_BURST_THRESHOLD = 10
+WINDOW_DESTINATION_FANOUT_THRESHOLD = 8
+WINDOW_PORT_FANOUT_THRESHOLD = 8
+WINDOW_HIGH_VOLUME_THRESHOLD = 5000.0
+WINDOW_REPEATED_DESTINATION_THRESHOLD = 5
 CROSS_TOKEN_BY_SPEC = {
     (scope, left_signal, right_signal): token
     for token, left_signal, right_signal, scope in CROSS_TOKEN_SPECS
@@ -1068,7 +1160,7 @@ def _scope_values_for_row(
     row: Mapping[str, Any] | pd.Series,
 ) -> dict[str, frozenset[str]]:
     result: dict[str, frozenset[str]] = {}
-    for scope in CROSS_TOKEN_SCOPES:
+    for scope in CONTEXT_FEATURE_SCOPES:
         if scope == "same_network_zone":
             zones: set[str] = set()
             for column in CROSS_SCOPE_COLUMNS[scope]:
@@ -1121,7 +1213,7 @@ def _active_cross_signals(
 ) -> frozenset[str]:
     return frozenset(
         signal
-        for signal in CROSS_ACTIVE_SIGNAL_NAMES
+        for signal in ROW_CROSS_SIGNAL_NAMES
         if (
             _novelty_signal_detected(
                 signal,
@@ -1133,6 +1225,486 @@ def _active_cross_signals(
             else CROSS_SIGNAL_DETECTORS[signal](row)
         )
     )
+
+
+def _window_observation(
+    row: Mapping[str, Any] | pd.Series,
+    active_signals: frozenset[str],
+) -> _CrossWindowObservation:
+    sources = _values_from_columns(
+        row,
+        CONTEXT_SOURCE_COLUMNS,
+        _canonical_ip_value,
+    )
+    destinations = _values_from_columns(
+        row,
+        NOVELTY_DESTINATION_IP_COLUMNS,
+        _canonical_ip_value,
+    )
+    destinations.update(
+        _values_from_columns(
+            row,
+            NOVELTY_DOMAIN_COLUMNS + NOVELTY_SNI_COLUMNS,
+            _canonical_domain_value,
+        )
+    )
+    def port_values(columns: Sequence[str]) -> frozenset[int]:
+        ports: set[int] = set()
+        for column in columns:
+            if not _row_has(row, column) or _is_missing_value(_row_get(row, column)):
+                continue
+            numeric = pd.to_numeric(_row_get(row, column), errors="coerce")
+            if not pd.isna(numeric) and float(numeric).is_integer():
+                port = int(numeric)
+                if 0 <= port <= 65535:
+                    ports.add(port)
+        return frozenset(ports)
+
+    protocols = {
+        protocol
+        for column in CONTEXT_PROTOCOL_COLUMNS
+        if _row_has(row, column)
+        and (protocol := _canonical_scope_value(_row_get(row, column))) is not None
+    }
+    processes = {
+        process
+        for column in CONTEXT_PROCESS_COLUMNS
+        if _row_has(row, column)
+        and (process := _canonical_scope_value(_row_get(row, column))) is not None
+    }
+    categories = frozenset(
+        subcategory
+        for subcategory in CONTEXT_SCOPES_BY_SUBCATEGORY
+        if _any_present(row, list(SUBCATEGORY_COVERAGE_ATTRIBUTES[subcategory]))
+    )
+    direction: str | None = None
+    for column in ("network_direction", "direction", "traffic_direction"):
+        if not _row_has(row, column) or _is_missing_value(_row_get(row, column)):
+            continue
+        candidate = _field_value(_row_get(row, column))
+        if candidate in {"out", "outbound", "egress"}:
+            direction = "outbound"
+        elif candidate in {"in", "inbound", "ingress"}:
+            direction = "inbound"
+        elif candidate in {"internal", "lateral"}:
+            direction = "internal"
+        break
+
+    total_size = max(
+        0.0,
+        _numeric_max(
+            row,
+            ["total_size", "bytes_out", "total_sum", "upload_bytes"],
+        ),
+    )
+    return _CrossWindowObservation(
+        sources=frozenset(sources),
+        destinations=frozenset(destinations),
+        source_ports=port_values(("src_port", "source_port", "local_port")),
+        destination_ports=port_values(
+            ("dst_port", "destination_port", "remote_port")
+        ),
+        protocols=frozenset(protocols),
+        processes=frozenset(processes),
+        total_size=total_size,
+        packet_count=max(
+            0.0,
+            _numeric_max(
+                row,
+                ["packet_number", "pkts_out", "pkts_in", "packet_count"],
+            ),
+        ),
+        categories=categories,
+        direction=direction,
+        failed_login="failed_login_burst" in active_signals,
+        successful_login="successful_login" in active_signals,
+        sensitive_read=bool(
+            {"sensitive_file_read", "system_sensitive_file_read", "secret_read_tool"}
+            & active_signals
+        ),
+        large_upload="large_upload" in active_signals,
+    )
+
+
+def _update_counter(counter: Counter[Any], values: Iterable[Any], delta: int) -> None:
+    for value in values:
+        counter[value] += delta
+        if counter[value] <= 0:
+            del counter[value]
+
+
+def _bucket_index(value: float, upper_bounds: Sequence[float]) -> int:
+    value = max(0.0, float(value))
+    for index, upper_bound in enumerate(upper_bounds):
+        if value <= upper_bound:
+            return index
+    return len(upper_bounds)
+
+
+def _bucket_label(index: int, upper_bounds: Sequence[float]) -> str:
+    if index < len(upper_bounds):
+        upper = float(upper_bounds[index])
+        upper_text = str(int(upper)) if upper.is_integer() else str(upper)
+        return f"b{index}_le_{upper_text}"
+    upper = float(upper_bounds[-1])
+    upper_text = str(int(upper)) if upper.is_integer() else str(upper)
+    return f"b{index}_gt_{upper_text}"
+
+
+def _add_window_observation(
+    state: _CrossWindowState,
+    signals: frozenset[str],
+    observation: _CrossWindowObservation,
+) -> None:
+    state.signal_counts.update(signals)
+    state.source_counts.update(observation.sources)
+    state.destination_counts.update(observation.destinations)
+    state.source_port_counts.update(observation.source_ports)
+    state.destination_port_counts.update(observation.destination_ports)
+    state.protocol_counts.update(observation.protocols)
+    state.process_counts.update(observation.processes)
+    state.category_counts.update(observation.categories)
+    if observation.direction is not None:
+        state.direction_counts[observation.direction] += 1
+    if observation.total_size > 0:
+        state.size_bucket_counts[
+            _bucket_index(
+                observation.total_size,
+                CONTEXT_MAGNITUDE_BUCKET_UPPER_BOUNDS,
+            )
+        ] += 1
+    if observation.packet_count > 0:
+        state.packet_bucket_counts[
+            _bucket_index(
+                observation.packet_count,
+                CONTEXT_MAGNITUDE_BUCKET_UPPER_BOUNDS,
+            )
+        ] += 1
+    state.failed_login_count += int(observation.failed_login)
+    state.successful_login_count += int(observation.successful_login)
+    state.sensitive_read_count += int(observation.sensitive_read)
+    state.large_upload_count += int(observation.large_upload)
+    state.total_size += observation.total_size
+    state.total_packets += observation.packet_count
+
+
+def _remove_window_observation(
+    state: _CrossWindowState,
+    signals: frozenset[str],
+    observation: _CrossWindowObservation,
+) -> None:
+    _update_counter(state.signal_counts, signals, -1)
+    _update_counter(state.source_counts, observation.sources, -1)
+    _update_counter(state.destination_counts, observation.destinations, -1)
+    _update_counter(state.source_port_counts, observation.source_ports, -1)
+    _update_counter(state.destination_port_counts, observation.destination_ports, -1)
+    _update_counter(state.protocol_counts, observation.protocols, -1)
+    _update_counter(state.process_counts, observation.processes, -1)
+    _update_counter(state.category_counts, observation.categories, -1)
+    if observation.direction is not None:
+        _update_counter(state.direction_counts, (observation.direction,), -1)
+    if observation.total_size > 0:
+        _update_counter(
+            state.size_bucket_counts,
+            (
+                _bucket_index(
+                    observation.total_size,
+                    CONTEXT_MAGNITUDE_BUCKET_UPPER_BOUNDS,
+                ),
+            ),
+            -1,
+        )
+    if observation.packet_count > 0:
+        _update_counter(
+            state.packet_bucket_counts,
+            (
+                _bucket_index(
+                    observation.packet_count,
+                    CONTEXT_MAGNITUDE_BUCKET_UPPER_BOUNDS,
+                ),
+            ),
+            -1,
+        )
+    state.failed_login_count -= int(observation.failed_login)
+    state.successful_login_count -= int(observation.successful_login)
+    state.sensitive_read_count -= int(observation.sensitive_read)
+    state.large_upload_count -= int(observation.large_upload)
+    state.total_size = max(0.0, state.total_size - observation.total_size)
+    state.total_packets = max(0.0, state.total_packets - observation.packet_count)
+
+
+def _window_signals_for_event(
+    state: _CrossWindowState,
+    observation: _CrossWindowObservation,
+) -> frozenset[str]:
+    event_count = len(state.events) + 1
+    destinations = set(state.destination_counts)
+    destinations.update(observation.destinations)
+    destination_ports = set(state.destination_port_counts)
+    destination_ports.update(observation.destination_ports)
+    repeated_destination_count = max(
+        (
+            state.destination_counts[destination]
+            + int(destination in observation.destinations)
+            for destination in destinations
+        ),
+        default=0,
+    )
+    total_size = state.total_size + observation.total_size
+
+    signals: set[str] = set()
+    if event_count >= WINDOW_FLOW_BURST_THRESHOLD:
+        signals.add("window_flow_burst")
+    if len(destinations) >= WINDOW_DESTINATION_FANOUT_THRESHOLD:
+        signals.add("window_destination_fanout")
+    if len(destination_ports) >= WINDOW_PORT_FANOUT_THRESHOLD:
+        signals.add("window_port_fanout")
+    if total_size >= WINDOW_HIGH_VOLUME_THRESHOLD:
+        signals.add("window_high_volume")
+    if repeated_destination_count >= WINDOW_REPEATED_DESTINATION_THRESHOLD:
+        signals.add("window_repeated_destination")
+    return frozenset(signals)
+
+
+def _context_bucket_token(
+    scope: str,
+    metric: str,
+    value: float,
+    upper_bounds: Sequence[float],
+) -> str:
+    bucket = _bucket_index(value, upper_bounds)
+    return f"context:{scope}:{metric}_15m={_bucket_label(bucket, upper_bounds)}"
+
+
+def _context_boolean_token(scope: str, metric: str) -> str:
+    return f"context:{scope}:{metric}_15m=true"
+
+
+def _window_context_tokens(
+    *,
+    state: _CrossWindowState,
+    observation: _CrossWindowObservation,
+    timestamp: datetime,
+    scope: str,
+    subcategory: str,
+) -> set[str]:
+    """Return identifier-free summaries for the causal window including this event."""
+    tokens = {
+        _context_bucket_token(
+            scope,
+            "event_count",
+            len(state.events) + 1,
+            CONTEXT_COUNT_BUCKET_UPPER_BOUNDS,
+        )
+    }
+    if state.events:
+        tokens.add(
+            _context_bucket_token(
+                scope,
+                "interarrival_seconds",
+                (timestamp - state.events[-1][0]).total_seconds(),
+                CONTEXT_INTERVAL_BUCKET_UPPER_BOUNDS,
+            )
+        )
+        tokens.add(
+            _context_bucket_token(
+                scope,
+                "window_span_seconds",
+                (timestamp - state.events[0][0]).total_seconds(),
+                CONTEXT_INTERVAL_BUCKET_UPPER_BOUNDS,
+            )
+        )
+
+    category_count = state.category_counts.get(subcategory, 0) + int(
+        subcategory in observation.categories
+    )
+    tokens.add(
+        _context_bucket_token(
+            scope,
+            f"{subcategory}_event_count",
+            category_count,
+            CONTEXT_COUNT_BUCKET_UPPER_BOUNDS,
+        )
+    )
+
+    if subcategory in {"network", "identity", "cloud"}:
+        distinct_sources = set(state.source_counts)
+        distinct_sources.update(observation.sources)
+        distinct_destinations = set(state.destination_counts)
+        distinct_destinations.update(observation.destinations)
+        for metric, count in (
+            ("distinct_source_count", len(distinct_sources)),
+            ("distinct_destination_count", len(distinct_destinations)),
+        ):
+            if count:
+                tokens.add(
+                    _context_bucket_token(
+                        scope,
+                        metric,
+                        count,
+                        CONTEXT_COUNT_BUCKET_UPPER_BOUNDS,
+                    )
+                )
+
+        if observation.destinations:
+            if any(
+                destination in state.destination_counts
+                for destination in observation.destinations
+            ):
+                tokens.add(
+                    _context_boolean_token(
+                        scope,
+                        "repeated_destination_in_window",
+                    )
+                )
+            else:
+                tokens.add(
+                    _context_boolean_token(
+                        scope,
+                        "new_destination_in_window",
+                    )
+                )
+
+    if subcategory == "network":
+        distinct_source_ports = set(state.source_port_counts)
+        distinct_source_ports.update(observation.source_ports)
+        distinct_destination_ports = set(state.destination_port_counts)
+        distinct_destination_ports.update(observation.destination_ports)
+        distinct_protocols = set(state.protocol_counts)
+        distinct_protocols.update(observation.protocols)
+        for metric, count in (
+            ("distinct_source_port_count", len(distinct_source_ports)),
+            ("distinct_destination_port_count", len(distinct_destination_ports)),
+            ("distinct_protocol_count", len(distinct_protocols)),
+            (
+                "inbound_count",
+                state.direction_counts.get("inbound", 0)
+                + int(observation.direction == "inbound"),
+            ),
+            (
+                "outbound_count",
+                state.direction_counts.get("outbound", 0)
+                + int(observation.direction == "outbound"),
+            ),
+        ):
+            if count:
+                tokens.add(
+                    _context_bucket_token(
+                        scope,
+                        metric,
+                        count,
+                        CONTEXT_COUNT_BUCKET_UPPER_BOUNDS,
+                    )
+                )
+
+        total_size = state.total_size + observation.total_size
+        total_packets = state.total_packets + observation.packet_count
+        if total_size > 0:
+            tokens.add(
+                _context_bucket_token(
+                    scope,
+                    "total_size",
+                    total_size,
+                    CONTEXT_MAGNITUDE_BUCKET_UPPER_BOUNDS,
+                )
+            )
+        if total_packets > 0:
+            tokens.add(
+                _context_bucket_token(
+                    scope,
+                    "total_packets",
+                    total_packets,
+                    CONTEXT_MAGNITUDE_BUCKET_UPPER_BOUNDS,
+                )
+            )
+        size_buckets = set(state.size_bucket_counts)
+        packet_buckets = set(state.packet_bucket_counts)
+        if observation.total_size > 0:
+            size_buckets.add(
+                _bucket_index(
+                    observation.total_size,
+                    CONTEXT_MAGNITUDE_BUCKET_UPPER_BOUNDS,
+                )
+            )
+        if observation.packet_count > 0:
+            packet_buckets.add(
+                _bucket_index(
+                    observation.packet_count,
+                    CONTEXT_MAGNITUDE_BUCKET_UPPER_BOUNDS,
+                )
+            )
+        if size_buckets:
+            max_bucket = max(size_buckets)
+            tokens.add(
+                f"context:{scope}:max_size_15m="
+                f"{_bucket_label(max_bucket, CONTEXT_MAGNITUDE_BUCKET_UPPER_BOUNDS)}"
+            )
+        if packet_buckets:
+            max_bucket = max(packet_buckets)
+            tokens.add(
+                f"context:{scope}:max_packets_15m="
+                f"{_bucket_label(max_bucket, CONTEXT_MAGNITUDE_BUCKET_UPPER_BOUNDS)}"
+            )
+        if state.category_counts.get("system", 0) > 0:
+            tokens.add(_context_boolean_token(scope, "prior_system_activity"))
+        if observation.large_upload and state.sensitive_read_count > 0:
+            tokens.add(
+                _context_boolean_token(scope, "sensitive_read_then_large_upload")
+            )
+
+    if subcategory in {"system", "identity", "llm"}:
+        distinct_processes = set(state.process_counts)
+        distinct_processes.update(observation.processes)
+        if distinct_processes:
+            tokens.add(
+                _context_bucket_token(
+                    scope,
+                    "distinct_process_count",
+                    len(distinct_processes),
+                    CONTEXT_COUNT_BUCKET_UPPER_BOUNDS,
+                )
+            )
+        for metric, count in (
+            (
+                "failed_login_count",
+                state.failed_login_count + int(observation.failed_login),
+            ),
+            (
+                "successful_login_count",
+                state.successful_login_count + int(observation.successful_login),
+            ),
+            (
+                "sensitive_read_count",
+                state.sensitive_read_count + int(observation.sensitive_read),
+            ),
+        ):
+            if count:
+                tokens.add(
+                    _context_bucket_token(
+                        scope,
+                        metric,
+                        count,
+                        CONTEXT_COUNT_BUCKET_UPPER_BOUNDS,
+                    )
+                )
+        if observation.successful_login and state.failed_login_count > 0:
+            tokens.add(_context_boolean_token(scope, "failed_then_success"))
+        if state.category_counts.get("network", 0) > 0:
+            tokens.add(_context_boolean_token(scope, "prior_network_activity"))
+
+    if subcategory in {"network", "llm", "cloud"}:
+        large_upload_count = state.large_upload_count + int(observation.large_upload)
+        if large_upload_count:
+            tokens.add(
+                _context_bucket_token(
+                    scope,
+                    "large_upload_count",
+                    large_upload_count,
+                    CONTEXT_COUNT_BUCKET_UPPER_BOUNDS,
+                )
+            )
+
+    return tokens
 
 
 def _tokens_closed_by_current_event(
@@ -1168,7 +1740,7 @@ def _single_event_cross_tokens(event: _PreparedCrossEvent) -> list[str]:
     return sorted(tokens, key=CROSS_TOKEN_ORDER.__getitem__)
 
 
-def contextual_cross_tokens_for_rows(
+def contextual_feature_tokens_for_rows(
     rows: Iterable[Mapping[str, Any] | pd.Series],
     *,
     window_minutes: float = 15.0,
@@ -1176,15 +1748,14 @@ def contextual_cross_tokens_for_rows(
     timestamp_iso_field: str | None = "event_time_iso",
     benign_novelty_baseline: BenignNoveltyBaseline | None = None,
     prf_key: bytes | None = None,
-) -> list[list[str]]:
-    """Build causal cross-event tokens while preserving input row order.
+) -> ContextualFeatureRows:
+    """Build label-independent causal features while preserving input row order.
 
-    A token is emitted for the event that closes a configured signal pair. The
-    counterpart signal may come from the same row or from an earlier event with
-    the same scope value inside the inclusive rolling window.
+    Scope identifiers partition local state but are not included in emitted
+    tokens. This gives every label branch the same observable representation.
     """
     if window_minutes <= 0:
-        return [
+        cross_tokens = [
             cross_tokens_for_row(
                 row,
                 benign_novelty_baseline=benign_novelty_baseline,
@@ -1192,6 +1763,13 @@ def contextual_cross_tokens_for_rows(
             )
             for row in rows
         ]
+        return ContextualFeatureRows(
+            cross_tokens=cross_tokens,
+            specialist_tokens={
+                subcategory: [[] for _ in cross_tokens]
+                for subcategory in CONTEXT_SCOPES_BY_SUBCATEGORY
+            },
+        )
 
     prepared_events: list[_PreparedCrossEvent] = []
     timestamp_issue_counts: Counter[str] = Counter()
@@ -1203,23 +1781,29 @@ def contextual_cross_tokens_for_rows(
         )
         if timestamp_issue is not None:
             timestamp_issue_counts[timestamp_issue] += 1
+        active_signals = _active_cross_signals(
+            row,
+            benign_novelty_baseline=benign_novelty_baseline,
+            prf_key=prf_key,
+        )
         prepared_events.append(
             _PreparedCrossEvent(
                 row_index=row_index,
                 timestamp=timestamp,
-                active_signals=_active_cross_signals(
-                    row,
-                    benign_novelty_baseline=benign_novelty_baseline,
-                    prf_key=prf_key,
-                ),
+                active_signals=active_signals,
                 scope_values=_scope_values_for_row(row),
+                window_observation=_window_observation(row, active_signals),
             )
         )
 
-    tokens_by_row: list[list[str]] = [[] for _ in prepared_events]
+    cross_tokens_by_row: list[list[str]] = [[] for _ in prepared_events]
+    specialist_tokens_by_row = {
+        subcategory: [[] for _ in prepared_events]
+        for subcategory in CONTEXT_SCOPES_BY_SUBCATEGORY
+    }
     for event in prepared_events:
         if event.timestamp is None:
-            tokens_by_row[event.row_index] = _single_event_cross_tokens(event)
+            cross_tokens_by_row[event.row_index] = _single_event_cross_tokens(event)
 
     timestamped_events = sorted(
         (event for event in prepared_events if event.timestamp is not None),
@@ -1230,45 +1814,91 @@ def contextual_cross_tokens_for_rows(
 
     for event in timestamped_events:
         assert event.timestamp is not None
-        event_tokens: set[str] = set()
+        event_cross_tokens: set[str] = set()
+        event_specialist_tokens: dict[str, set[str]] = {
+            subcategory: set() for subcategory in CONTEXT_SCOPES_BY_SUBCATEGORY
+        }
         for scope, values in event.scope_values.items():
             for value in values:
                 state = states.setdefault(
                     (scope, value),
-                    _CrossWindowState(events=deque(), signal_counts=Counter()),
+                    _CrossWindowState(
+                        events=deque(),
+                        signal_counts=Counter(),
+                        source_counts=Counter(),
+                        destination_counts=Counter(),
+                        source_port_counts=Counter(),
+                        destination_port_counts=Counter(),
+                        protocol_counts=Counter(),
+                        process_counts=Counter(),
+                        category_counts=Counter(),
+                        direction_counts=Counter(),
+                        size_bucket_counts=Counter(),
+                        packet_bucket_counts=Counter(),
+                    ),
                 )
                 cutoff = event.timestamp - window
                 while state.events and state.events[0][0] < cutoff:
-                    _, expired_signals = state.events.popleft()
-                    for signal in expired_signals:
-                        state.signal_counts[signal] -= 1
-                        if state.signal_counts[signal] <= 0:
-                            del state.signal_counts[signal]
+                    _, expired_signals, expired_observation = state.events.popleft()
+                    _remove_window_observation(
+                        state,
+                        expired_signals,
+                        expired_observation,
+                    )
 
+                current_signals = set(event.active_signals)
+                if scope in WINDOW_AGGREGATION_SCOPES:
+                    current_signals.update(
+                        _window_signals_for_event(
+                            state,
+                            event.window_observation,
+                        )
+                    )
+                frozen_current_signals = frozenset(current_signals)
                 available_signals = set(state.signal_counts)
-                available_signals.update(event.active_signals)
-                event_tokens.update(
-                    _tokens_closed_by_current_event(
-                        scope=scope,
-                        current_signals=event.active_signals,
-                        available_signals=available_signals,
+                available_signals.update(frozen_current_signals)
+                if scope in CROSS_TOKEN_SCOPES:
+                    event_cross_tokens.update(
+                        _tokens_closed_by_current_event(
+                            scope=scope,
+                            current_signals=frozen_current_signals,
+                            available_signals=available_signals,
+                        )
+                    )
+                for subcategory in event.window_observation.categories:
+                    if scope not in CONTEXT_SCOPES_BY_SUBCATEGORY[subcategory]:
+                        continue
+                    event_specialist_tokens[subcategory].update(
+                        _window_context_tokens(
+                            state=state,
+                            observation=event.window_observation,
+                            timestamp=event.timestamp,
+                            scope=scope,
+                            subcategory=subcategory,
+                        )
+                    )
+                state.events.append(
+                    (
+                        event.timestamp,
+                        frozen_current_signals,
+                        event.window_observation,
                     )
                 )
-
-        if event.active_signals:
-            for scope, values in event.scope_values.items():
-                for value in values:
-                    state = states[(scope, value)]
-                    state.events.append((event.timestamp, event.active_signals))
-                    state.signal_counts.update(event.active_signals)
-        tokens_by_row[event.row_index] = sorted(
-            event_tokens,
+                _add_window_observation(
+                    state,
+                    frozen_current_signals,
+                    event.window_observation,
+                )
+        cross_tokens_by_row[event.row_index] = sorted(
+            event_cross_tokens,
             key=CROSS_TOKEN_ORDER.__getitem__,
         )
+        for subcategory, tokens in event_specialist_tokens.items():
+            specialist_tokens_by_row[subcategory][event.row_index] = sorted(tokens)
 
     if timestamp_issue_counts:
         LOGGER.warning(
-            "Cross-context extraction used single-row evidence for %s row(s) "
+            "Causal context extraction used row-local evidence for %s row(s) "
             "without a reliable timestamp (%s)",
             sum(timestamp_issue_counts.values()),
             ", ".join(
@@ -1276,7 +1906,30 @@ def contextual_cross_tokens_for_rows(
                 for reason, count in sorted(timestamp_issue_counts.items())
             ),
         )
-    return tokens_by_row
+    return ContextualFeatureRows(
+        cross_tokens=cross_tokens_by_row,
+        specialist_tokens=specialist_tokens_by_row,
+    )
+
+
+def contextual_cross_tokens_for_rows(
+    rows: Iterable[Mapping[str, Any] | pd.Series],
+    *,
+    window_minutes: float = 15.0,
+    timestamp_epoch_field: str | None = "event_time_epoch",
+    timestamp_iso_field: str | None = "event_time_iso",
+    benign_novelty_baseline: BenignNoveltyBaseline | None = None,
+    prf_key: bytes | None = None,
+) -> list[list[str]]:
+    """Build causal cross-event tokens while preserving input row order."""
+    return contextual_feature_tokens_for_rows(
+        rows,
+        window_minutes=window_minutes,
+        timestamp_epoch_field=timestamp_epoch_field,
+        timestamp_iso_field=timestamp_iso_field,
+        benign_novelty_baseline=benign_novelty_baseline,
+        prf_key=prf_key,
+    ).cross_tokens
 
 
 def cross_tokens_for_row(
@@ -1345,6 +1998,7 @@ def build_subcategory_texts(
     context_timestamp_iso_field: str | None = "event_time_iso",
     benign_novelty_baselines: Mapping[int, BenignNoveltyBaseline] | None = None,
     prf_key: bytes | None = None,
+    include_context_window_features: bool = True,
 ) -> tuple[dict[str, list[list[str]]], dict[str, dict[int, list[str]]]]:
     selected_subcategories = list(subcategories) if subcategories is not None else list(SUBCATEGORY_NAMES)
     texts_by_subcategory: dict[str, list[list[str]]] = {
@@ -1356,28 +2010,69 @@ def build_subcategory_texts(
     for subcategory in selected_subcategories:
         if subcategory not in SUBCATEGORY_NAMES:
             raise ValueError(f"Unsupported subcategory: {subcategory}")
-        for dataset in org_datasets:
+
+    for dataset in org_datasets:
+        contextual_rows: ContextualFeatureRows | None = None
+        if "cross" in selected_subcategories or (
+            include_context_window_features and context_window_minutes > 0
+        ):
+            columns = list(dataset.logs_df.columns)
+            rows = (
+                dict(zip(columns, values))
+                for values in dataset.logs_df.itertuples(index=False, name=None)
+            )
+            contextual_rows = contextual_feature_tokens_for_rows(
+                rows,
+                window_minutes=context_window_minutes,
+                timestamp_epoch_field=context_timestamp_epoch_field,
+                timestamp_iso_field=context_timestamp_iso_field,
+                benign_novelty_baseline=(
+                    benign_novelty_baselines.get(dataset.org_index)
+                    if benign_novelty_baselines is not None
+                    else None
+                ),
+                prf_key=prf_key,
+            )
+
+        for subcategory in selected_subcategories:
             if subcategory == "cross":
-                texts, missing = build_cross_texts_for_org(
-                    dataset,
-                    context_window_minutes=context_window_minutes,
-                    context_timestamp_epoch_field=context_timestamp_epoch_field,
-                    context_timestamp_iso_field=context_timestamp_iso_field,
-                    benign_novelty_baseline=(
-                        benign_novelty_baselines.get(dataset.org_index)
-                        if benign_novelty_baselines is not None
-                        else None
-                    ),
-                    prf_key=prf_key,
-                )
+                assert contextual_rows is not None
+                texts = [" ".join(tokens) for tokens in contextual_rows.cross_tokens]
+                missing: list[str] = []
             else:
                 texts, missing = build_specialized_texts_for_org(
                     dataset,
                     subcategory,
                     SUBCATEGORY_SCHEMAS[subcategory],
                 )
+                if (
+                    include_context_window_features
+                    and context_window_minutes > 0
+                    and contextual_rows is not None
+                ):
+                    context_tokens = contextual_rows.specialist_tokens[subcategory]
+                    rows_with_context = sum(bool(tokens) for tokens in context_tokens)
+                    total_context_tokens = sum(len(tokens) for tokens in context_tokens)
+                    LOGGER.info(
+                        "Organization %s %s causal context: rows=%s/%s tokens=%s",
+                        dataset.org_index,
+                        subcategory,
+                        rows_with_context,
+                        len(context_tokens),
+                        total_context_tokens,
+                    )
+                    texts = [
+                        " ".join(part for part in (text, " ".join(tokens)) if part)
+                        for text, tokens in zip(texts, context_tokens)
+                    ]
             texts_by_subcategory[subcategory].append(texts)
             missing_by_subcategory[subcategory][dataset.org_index] = missing
+        if context_window_minutes > 0:
+            LOGGER.info(
+                "Organization %s specialist inputs use a causal %.1f-minute context window",
+                dataset.org_index,
+                context_window_minutes,
+            )
     return texts_by_subcategory, missing_by_subcategory
 
 
@@ -1387,6 +2082,121 @@ def build_subcategory_token_counters(
     return {
         subcategory: [build_token_counters(texts) for texts in org_texts]
         for subcategory, org_texts in texts_by_subcategory.items()
+    }
+
+
+def _representation_digest(
+    *,
+    token_counters_by_subcategory: Mapping[str, list[list[Counter[str]]]],
+    subcategories: Sequence[str],
+    org_position: int,
+    row_index: int,
+) -> bytes:
+    digest = hashlib.sha256()
+    for subcategory in sorted(subcategories):
+        digest.update(subcategory.encode("utf-8"))
+        digest.update(b"\0")
+        counter = token_counters_by_subcategory[subcategory][org_position][row_index]
+        for token, count in sorted(counter.items()):
+            if count == 0:
+                continue
+            digest.update(token.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(count).encode("ascii"))
+            digest.update(b"\0")
+    return digest.digest()
+
+
+def _collision_summary(
+    groups: Mapping[bytes, Counter[str]],
+    *,
+    excluded_labels: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    total_rows = 0
+    unique_representations = 0
+    ambiguous_representation_count = 0
+    ambiguous_rows = 0
+    majority_correct = 0
+    largest_collisions: list[tuple[bytes, Counter[str]]] = []
+    for digest, raw_label_counts in groups.items():
+        label_counts = Counter(
+            {
+                label: count
+                for label, count in raw_label_counts.items()
+                if label not in excluded_labels
+            }
+        )
+        group_size = sum(label_counts.values())
+        if group_size == 0:
+            continue
+        total_rows += group_size
+        unique_representations += 1
+        majority_correct += max(label_counts.values())
+        if len(label_counts) <= 1:
+            continue
+        ambiguous_representation_count += 1
+        ambiguous_rows += group_size
+        largest_collisions.append((digest, label_counts))
+        largest_collisions.sort(
+            key=lambda item: (-sum(item[1].values()), item[0])
+        )
+        del largest_collisions[10:]
+    return {
+        "num_rows": total_rows,
+        "num_unique_representations": unique_representations,
+        "num_ambiguous_representations": ambiguous_representation_count,
+        "rows_in_ambiguous_representations": ambiguous_rows,
+        "ambiguous_row_fraction": (
+            float(ambiguous_rows / total_rows) if total_rows else 0.0
+        ),
+        "exact_representation_majority_ceiling": (
+            float(majority_correct / total_rows) if total_rows else 0.0
+        ),
+        "largest_ambiguous_representations": [
+            {
+                "representation_sha256": digest.hex(),
+                "num_rows": sum(label_counts.values()),
+                "label_counts": dict(sorted(label_counts.items())),
+            }
+            for digest, label_counts in largest_collisions
+        ],
+    }
+
+
+def representation_ambiguity_diagnostics(
+    *,
+    org_datasets: Sequence[OrgDataset],
+    splits: Sequence[Any],
+    token_counters_by_subcategory: Mapping[str, list[list[Counter[str]]]],
+    subcategories: Sequence[str],
+) -> dict[str, Any]:
+    per_org: list[dict[str, Any]] = []
+    for org_position, (dataset, split) in enumerate(zip(org_datasets, splits)):
+        all_groups: dict[bytes, Counter[str]] = {}
+        for raw_row_index in split.train_indices:
+            row_index = int(raw_row_index)
+            label = str(dataset.labels[row_index])
+            digest = _representation_digest(
+                token_counters_by_subcategory=token_counters_by_subcategory,
+                subcategories=subcategories,
+                org_position=org_position,
+                row_index=row_index,
+            )
+            all_groups.setdefault(digest, Counter())[label] += 1
+        per_org.append(
+            {
+                "org_index": dataset.org_index,
+                "all_training_rows": _collision_summary(all_groups),
+                "non_benign_training_rows": _collision_summary(
+                    all_groups,
+                    excluded_labels=frozenset({"benign"}),
+                ),
+            }
+        )
+    return {
+        "version": 1,
+        "representation": "all-active-subcategory-token-counters",
+        "per_org": per_org,
     }
 
 
@@ -1444,7 +2254,11 @@ def build_hierarchical_config(
 ) -> HierarchicalModelConfig:
     payload = _load_hierarchical_payload(config_path)
     label_payload = payload.get("labels", {})
-    weight_payload = payload.get("ensemble", {}).get("weights", {})
+    ensemble_payload = payload.get("ensemble", {})
+    weight_payload = ensemble_payload.get("weights", {})
+    coverage_aware = ensemble_payload.get("coverage_aware", True)
+    if not isinstance(coverage_aware, bool):
+        raise ValueError("ensemble.coverage_aware must be a boolean")
     labels = [label for label in observed_labels if label in observed_labels]
     branches: dict[str, LabelBranchConfig] = {}
 
@@ -1470,8 +2284,9 @@ def build_hierarchical_config(
     return HierarchicalModelConfig(
         labels=labels,
         branches=branches,
-        fusion=payload.get("ensemble", {}).get("fusion", "logit"),
+        fusion=ensemble_payload.get("fusion", "logit"),
         fusion_mode=fusion_mode,
+        coverage_aware=coverage_aware,
     )
 
 
@@ -1980,6 +2795,67 @@ def logits_for_org_rows(
     return X, binary_logits(X, state.weights, state.bias)
 
 
+def _token_field(token: str) -> str:
+    equals_index = token.find("=")
+    colon_index = token.find(":")
+    separators = [index for index in (equals_index, colon_index) if index >= 0]
+    return token[: min(separators)] if separators else token
+
+
+def token_counter_has_subcategory_coverage(
+    counter: Mapping[str, int],
+    subcategory: str,
+) -> bool:
+    coverage_fields = SUBCATEGORY_COVERAGE_ATTRIBUTES[subcategory]
+    return any(
+        count != 0 and _token_field(token) in coverage_fields
+        for token, count in counter.items()
+    )
+
+
+def _coverage_for_org_rows(
+    *,
+    state: SpecialistState,
+    org_position: int,
+    row_indices: np.ndarray,
+    feature_matrix: sparse.csr_matrix,
+) -> np.ndarray:
+    counters = select_items(state.org_token_counters[org_position], row_indices)
+    coverage_fields = SUBCATEGORY_COVERAGE_ATTRIBUTES[state.subcategory]
+    candidate_tokens = sorted(
+        {
+            token
+            for counter in counters
+            for token, count in counter.items()
+            if count != 0 and _token_field(token) in coverage_fields
+        }
+    )
+    candidate_tags = tag_namespaced_vocabulary(
+        candidate_tokens,
+        state.prf_key,
+        subcategory=state.subcategory,
+    )
+    global_tags = set(state.global_tags)
+    projected_native_tokens = {
+        token
+        for token, tag in zip(candidate_tokens, candidate_tags)
+        if tag in global_tags
+    }
+    native_evidence = np.fromiter(
+        (
+            any(
+                count != 0 and token in projected_native_tokens
+                for token, count in counter.items()
+            )
+            for counter in counters
+        ),
+        dtype=bool,
+        count=len(counters),
+    )
+    projected_evidence = np.asarray(feature_matrix.getnnz(axis=1)).ravel() > 0
+    return native_evidence & projected_evidence
+
+
 def collect_logits_for_rows(
     specialists: dict[str, dict[str, SpecialistState]],
     org_position: int,
@@ -1988,12 +2864,19 @@ def collect_logits_for_rows(
     include_features: bool = False,
     feature_matrix_cache: FeatureMatrixCache | None = None,
     cache_partition: str | None = None,
-) -> tuple[dict[str, dict[str, np.ndarray]], dict[str, dict[str, np.ndarray]]]:
+) -> tuple[
+    dict[str, dict[str, np.ndarray]],
+    dict[str, dict[str, np.ndarray]],
+    dict[str, dict[str, np.ndarray]],
+]:
     logits: dict[str, dict[str, np.ndarray]] = {}
     features: dict[str, dict[str, np.ndarray]] = {}
+    coverage: dict[str, dict[str, np.ndarray]] = {}
+    coverage_cache: dict[tuple[str, tuple[str, ...]], np.ndarray] = {}
     for label, by_subcategory in specialists.items():
         logits[label] = {}
         features[label] = {}
+        coverage[label] = {}
         for subcategory, state in by_subcategory.items():
             X, sub_logits = logits_for_org_rows(
                 state,
@@ -2005,7 +2888,16 @@ def collect_logits_for_rows(
             if include_features:
                 features[label][subcategory] = X
             logits[label][subcategory] = sub_logits
-    return logits, features
+            coverage_key = (subcategory, tuple(state.global_tags))
+            if coverage_key not in coverage_cache:
+                coverage_cache[coverage_key] = _coverage_for_org_rows(
+                    state=state,
+                    org_position=org_position,
+                    row_indices=row_indices,
+                    feature_matrix=X,
+                )
+            coverage[label][subcategory] = coverage_cache[coverage_key]
+    return logits, features, coverage
 
 
 def evaluate_hierarchical_ensemble(
@@ -2023,7 +2915,7 @@ def evaluate_hierarchical_ensemble(
     softmax_lower_bounds: list[float] = []
     softmax_upper_bounds: list[float] = []
     for org_position, (labels, split) in enumerate(zip(encoded_labels_by_org, splits)):
-        logits_by_label, _ = collect_logits_for_rows(
+        logits_by_label, _, coverage_by_label = collect_logits_for_rows(
             specialists,
             org_position,
             split.test_indices,
@@ -2034,6 +2926,7 @@ def evaluate_hierarchical_ensemble(
         label_logits, probabilities = fused_probabilities(
             fusion,
             logits_by_label,
+            coverage_by_label=coverage_by_label,
             log_context=f"Ensemble evaluation org {org_position}",
         )
         lower_bound, upper_bound = observed_bounds(label_logits)
@@ -2052,6 +2945,13 @@ def evaluate_hierarchical_ensemble(
                 "num_test_examples": len(test_labels),
                 "softmax_input_lower_bound": lower_bound,
                 "softmax_input_upper_bound": upper_bound,
+                "coverage_rates": {
+                    label: {
+                        subcategory: float(np.mean(mask)) if len(mask) else 0.0
+                        for subcategory, mask in by_subcategory.items()
+                    }
+                    for label, by_subcategory in coverage_by_label.items()
+                },
             }
         )
     labels_array = np.asarray(labels_all, dtype=int)
@@ -2144,7 +3044,7 @@ def generate_hierarchical_predictions(
     records: list[dict[str, Any]] = []
     for org_position, dataset in enumerate(org_datasets):
         row_indices = np.arange(len(dataset.labels), dtype=int)
-        logits_by_label, _ = collect_logits_for_rows(
+        logits_by_label, _, coverage_by_label = collect_logits_for_rows(
             specialists,
             org_position,
             row_indices,
@@ -2155,6 +3055,7 @@ def generate_hierarchical_predictions(
         label_logits, probabilities = fused_probabilities(
             fusion,
             logits_by_label,
+            coverage_by_label=coverage_by_label,
             log_context=f"Inference org {dataset.org_index}",
         )
         predictions = np.argmax(probabilities, axis=1)
@@ -2170,6 +3071,10 @@ def generate_hierarchical_predictions(
                     for subcategory, logits in subcategory_logits.items()
                 }
                 for label, subcategory_logits in logits_by_label.items()
+            }
+            subcategory_coverage = {
+                subcategory: bool(mask[row_index])
+                for subcategory, mask in coverage_by_label[predicted_label].items()
             }
             contributions_for_prediction: dict[str, dict[str, list[dict[str, Any]]]] = {}
             if high_risk:
@@ -2197,6 +3102,7 @@ def generate_hierarchical_predictions(
                 "probabilities": _dict_from_row(probabilities[row_index], label_classes),
                 "label_logits": _dict_from_row(label_logits[row_index], label_classes),
                 "subcategory_logits": subcategory_logits,
+                "subcategory_coverage": subcategory_coverage,
                 "top_contributions": contributions_for_prediction,
                 "high_risk": high_risk,
                 "max_risk_probability": max_probability,
@@ -2232,6 +3138,7 @@ def save_hierarchical_artifacts(
                 "bias": f"final_{prefix}_bias.npy",
                 "prf_namespace": "subcategory|token",
                 "weight_coordinate_system": "tf",
+                "numeric_bucketing": numeric_bucketing_metadata(),
                 **(
                     {
                         "cross_vocabulary": {
@@ -2289,6 +3196,7 @@ def write_hierarchical_inference_outputs(
             "max_risk_probability": record["max_risk_probability"],
             "label_logits": record["label_logits"],
             "subcategory_logits": record["subcategory_logits"],
+            "subcategory_coverage": record["subcategory_coverage"],
             "top_contributions": record["top_contributions"],
             **(
                 {"source_log_id": record["source_log_id"]}

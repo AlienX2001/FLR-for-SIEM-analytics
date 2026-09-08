@@ -6,11 +6,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from federated_lr_pipeline.feature_schemas import (
+    CONTEXT_FEATURE_SCHEMA_SHA256,
+    CONTEXT_FEATURE_VERSION,
     CROSS_VOCABULARY_LOCAL_EQUALS_GLOBAL,
     CROSS_VOCABULARY_SHA256,
     CROSS_VOCABULARY_SIZE,
     CROSS_VOCABULARY_VERSION,
 )
+from federated_lr_pipeline.numeric_features import numeric_bucketing_metadata
 
 
 @dataclass(frozen=True)
@@ -81,17 +84,25 @@ class PipelineConfig:
             payload["model_artifact_dir"] = str(self.model_artifact_dir)
         payload["effective_label_column_default"] = self.label_column or "label"
         payload["cross_context"] = {
-            "version": 1,
+            "version": 2,
             "causal": True,
             "window_minutes": self.context_window_minutes,
             "timestamp_epoch_field": self.context_timestamp_epoch_field,
             "timestamp_iso_field": self.context_timestamp_iso_field,
+            "specialist_window_features": {
+                "enabled": self.context_window_minutes > 0,
+                "version": CONTEXT_FEATURE_VERSION,
+                "schema_sha256": CONTEXT_FEATURE_SCHEMA_SHA256,
+                "scope_values_emitted": False,
+                "absolute_timestamps_emitted": False,
+            },
         }
         payload["prf_namespace"] = {
             "version": 2,
             "format": "subcategory|token",
         }
         payload["global_weight_coordinate_system"] = "tf"
+        payload["numeric_bucketing"] = numeric_bucketing_metadata()
         payload["cross_vocabulary"] = {
             "version": CROSS_VOCABULARY_VERSION,
             "size": CROSS_VOCABULARY_SIZE,

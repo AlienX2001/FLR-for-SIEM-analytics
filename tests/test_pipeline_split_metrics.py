@@ -159,6 +159,8 @@ def test_pipeline_reports_held_out_test_metrics_and_class_weights(tmp_path: Path
 
     assert metrics["split"]["test_size"] == 0.2
     assert metrics["class_weight"]["mode"] == "balanced"
+    assert metrics["context_features"]["version"] == 2
+    assert metrics["context_features"]["specialist_window_features"]["enabled"] is True
     assert metrics["rounds"]
     final_round = metrics["rounds"][-1]
     assert "ensemble_metrics" in final_round
@@ -175,6 +177,7 @@ def test_pipeline_reports_held_out_test_metrics_and_class_weights(tmp_path: Path
     assert "sigmoid_input_lower_bound" in first_specialist["local_metrics"][0]
     assert "sigmoid_input_upper_bound" in first_specialist["local_metrics"][0]
     assert (output_dir / "hierarchical_model_manifest.json").exists()
+    assert (output_dir / "representation_diagnostics.json").exists()
     assert (output_dir / "manual_logit_fusion.json").exists()
     assert (output_dir / "final_benign_system_weights.npy").exists()
     assert (output_dir / "final_malicious_network_weights.npy").exists()

@@ -19,7 +19,12 @@ class EnsembleFusion(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def predict_logits(self, logits_by_label: dict[str, dict[str, np.ndarray]]) -> np.ndarray:
+    def predict_logits(
+        self,
+        logits_by_label: dict[str, dict[str, np.ndarray]],
+        *,
+        coverage_by_label: dict[str, dict[str, np.ndarray]] | None = None,
+    ) -> np.ndarray:
         raise NotImplementedError
 
     @abstractmethod
@@ -38,15 +43,22 @@ class ManualLogitFusion(EnsembleFusion):
         labels: list[str],
         subcategories_by_label: dict[str, list[str]],
         weights_by_label: dict[str, dict[str, float]],
+        coverage_aware: bool = True,
     ) -> None:
         self.labels = labels
         self.subcategories_by_label = subcategories_by_label
         self.weights_by_label = weights_by_label
+        self.coverage_aware = coverage_aware
 
     def fit(self, specialist_logits: Any, labels: Any) -> None:
         return None
 
-    def predict_logits(self, logits_by_label: dict[str, dict[str, np.ndarray]]) -> np.ndarray:
+    def predict_logits(
+        self,
+        logits_by_label: dict[str, dict[str, np.ndarray]],
+        *,
+        coverage_by_label: dict[str, dict[str, np.ndarray]] | None = None,
+    ) -> np.ndarray:
         label_logits: list[np.ndarray] = []
         for label in self.labels:
             label_weights = self.weights_by_label.get(label, {})
@@ -54,6 +66,22 @@ class ManualLogitFusion(EnsembleFusion):
             fused: np.ndarray | None = None
             for subcategory in subcategories:
                 sub_logits = np.asarray(logits_by_label[label][subcategory], dtype=float)
+                if self.coverage_aware and coverage_by_label is not None:
+                    try:
+                        coverage = np.asarray(
+                            coverage_by_label[label][subcategory],
+                            dtype=bool,
+                        )
+                    except KeyError as exc:
+                        raise ValueError(
+                            f"Missing coverage for {label}/{subcategory}"
+                        ) from exc
+                    if coverage.shape != sub_logits.shape:
+                        raise ValueError(
+                            f"Coverage shape {coverage.shape} does not match logits "
+                            f"shape {sub_logits.shape} for {label}/{subcategory}"
+                        )
+                    sub_logits = np.where(coverage, sub_logits, 0.0)
                 contribution = label_weights.get(subcategory, 1.0) * sub_logits
                 fused = contribution if fused is None else fused + contribution
             if fused is None:
@@ -68,6 +96,7 @@ class ManualLogitFusion(EnsembleFusion):
             "labels": self.labels,
             "subcategories_by_label": self.subcategories_by_label,
             "weights_by_label": self.weights_by_label,
+            "coverage_aware": self.coverage_aware,
         }
         with Path(path).open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
@@ -89,6 +118,7 @@ class ManualLogitFusion(EnsembleFusion):
                 str(label): {str(k): float(v) for k, v in weights.items()}
                 for label, weights in payload["weights_by_label"].items()
             },
+            coverage_aware=bool(payload.get("coverage_aware", False)),
         )
 
 
@@ -96,7 +126,13 @@ class MetaLogitFusion(EnsembleFusion):
     def fit(self, specialist_logits: Any, labels: Any) -> None:
         raise NotImplementedError("MetaLogitFusion is reserved for a later implementation")
 
-    def predict_logits(self, logits_by_label: dict[str, dict[str, np.ndarray]]) -> np.ndarray:
+    def predict_logits(
+        self,
+        logits_by_label: dict[str, dict[str, np.ndarray]],
+        *,
+        coverage_by_label: dict[str, dict[str, np.ndarray]] | None = None,
+    ) -> np.ndarray:
+        del coverage_by_label
         raise NotImplementedError("MetaLogitFusion is reserved for a later implementation")
 
     def save(self, path: str | Path) -> None:
@@ -111,9 +147,13 @@ def fused_probabilities(
     fusion: EnsembleFusion,
     logits_by_label: dict[str, dict[str, np.ndarray]],
     *,
+    coverage_by_label: dict[str, dict[str, np.ndarray]] | None = None,
     log_context: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    label_logits = fusion.predict_logits(logits_by_label)
+    label_logits = fusion.predict_logits(
+        logits_by_label,
+        coverage_by_label=coverage_by_label,
+    )
     if log_context is not None:
         lower_bound, upper_bound = observed_bounds(label_logits)
         LOGGER.info(

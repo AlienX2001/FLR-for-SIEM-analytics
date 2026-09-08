@@ -21,11 +21,14 @@ from federated_lr_pipeline.config import PipelineConfig
 from federated_lr_pipeline.data import OrgDataset, load_all_orgs
 from federated_lr_pipeline.ensemble import ManualLogitFusion, fused_probabilities
 from federated_lr_pipeline.feature_schemas import (
+    CONTEXT_FEATURE_SCHEMA_SHA256,
+    CONTEXT_FEATURE_VERSION,
     CROSS_VOCABULARY_LOCAL_EQUALS_GLOBAL,
     CROSS_VOCABULARY_SHA256,
     CROSS_VOCABULARY_SIZE,
     CROSS_VOCABULARY_VERSION,
 )
+from federated_lr_pipeline.numeric_features import numeric_bucketing_metadata
 from federated_lr_pipeline.prf import derive_prf_key
 from federated_lr_pipeline.specialized_models import (
     BENIGN_NOVELTY_BASELINE_FILENAME,
@@ -159,6 +162,7 @@ def _fusion_from_hierarchy(path: Path, label_classes: list[str]) -> ManualLogitF
         labels=label_classes,
         subcategories_by_label=subcategories_by_label,
         weights_by_label=weights_by_label,
+        coverage_aware=bool(payload.get("ensemble", {}).get("coverage_aware", True)),
     )
 
 
@@ -207,6 +211,7 @@ def _apply_testing_fusion_override(
         labels=fusion.labels,
         subcategories_by_label=fusion.subcategories_by_label,
         weights_by_label=weights_by_label,
+        coverage_aware=fusion.coverage_aware,
     )
 
 
@@ -521,6 +526,12 @@ def load_testing_artifacts(
             "run_config.json is missing the training seed required for local PRF "
             "projection"
         )
+    expected_numeric_bucketing = numeric_bucketing_metadata()
+    if run_config.get("numeric_bucketing") != expected_numeric_bucketing:
+        raise ValueError(
+            "Testing artifacts use an incompatible numeric feature encoding. "
+            "Retrain with the current numeric bucketing configuration."
+        )
     prf_key = derive_prf_key(int(run_config["seed"]))
     expected_cross_vocabulary = {
         "version": CROSS_VOCABULARY_VERSION,
@@ -603,6 +614,7 @@ def load_testing_artifacts(
         context_window_minutes = 0.0
         context_timestamp_epoch_field = "event_time_epoch"
         context_timestamp_iso_field = "event_time_iso"
+        include_context_window_features = False
         if "cross" in active_subcategories:
             LOGGER.warning(
                 "Training run_config.json has no cross_context metadata; using "
@@ -612,7 +624,7 @@ def load_testing_artifacts(
         if not isinstance(cross_context, dict):
             raise ValueError("run_config.json cross_context must be an object")
         version = int(cross_context.get("version", 0))
-        if version != 1:
+        if version not in {1, 2}:
             raise ValueError(
                 f"Unsupported run_config.json cross_context version: {version}"
             )
@@ -638,6 +650,30 @@ def load_testing_artifacts(
             raise ValueError(
                 "Saved cross_context epoch and ISO timestamp fields must differ"
             )
+        include_context_window_features = False
+        if version == 2:
+            feature_metadata = cross_context.get("specialist_window_features")
+            if not isinstance(feature_metadata, dict):
+                raise ValueError(
+                    "Saved cross_context.specialist_window_features must be an object"
+                )
+            if int(feature_metadata.get("version", 0)) != CONTEXT_FEATURE_VERSION:
+                raise ValueError(
+                    "Unsupported specialist window feature version: "
+                    f"{feature_metadata.get('version')!r}"
+                )
+            if feature_metadata.get("schema_sha256") != CONTEXT_FEATURE_SCHEMA_SHA256:
+                raise ValueError(
+                    "Saved specialist window feature schema does not match this code version"
+                )
+            include_context_window_features = bool(
+                feature_metadata.get("enabled", False)
+            )
+            if include_context_window_features != (context_window_minutes > 0):
+                raise ValueError(
+                    "Saved specialist window feature enabled state conflicts with "
+                    "cross_context.window_minutes"
+                )
 
     texts_by_subcategory, _ = build_subcategory_texts(
         org_datasets,
@@ -647,6 +683,7 @@ def load_testing_artifacts(
         context_timestamp_iso_field=context_timestamp_iso_field,
         benign_novelty_baselines=benign_novelty_baselines,
         prf_key=prf_key,
+        include_context_window_features=include_context_window_features,
     )
     token_counters_by_subcategory = build_subcategory_token_counters(texts_by_subcategory)
     specialists: dict[str, dict[str, SpecialistState]] = {}
@@ -738,7 +775,7 @@ def run_testing_inference(
     for org_position, dataset in enumerate(org_datasets):
         row_indices = np.arange(len(dataset.labels), dtype=int)
         feature_matrix_cache = {}
-        logits_by_label, _ = collect_logits_for_rows(
+        logits_by_label, _, coverage_by_label = collect_logits_for_rows(
             artifacts.specialists,
             org_position,
             row_indices,
@@ -749,6 +786,7 @@ def run_testing_inference(
         label_logits, probabilities = fused_probabilities(
             artifacts.fusion,
             logits_by_label,
+            coverage_by_label=coverage_by_label,
             log_context=f"Testing inference org {dataset.org_index}",
         )
         predictions = np.argmax(probabilities, axis=1)
@@ -772,6 +810,10 @@ def run_testing_inference(
                     for subcategory, logits in by_subcategory.items()
                 }
                 for label, by_subcategory in logits_by_label.items()
+            }
+            subcategory_coverage = {
+                subcategory: bool(mask[row_index])
+                for subcategory, mask in coverage_by_label[predicted_label].items()
             }
             max_probability = float(np.max(probabilities[row_index]))
             contributions_for_prediction: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -807,6 +849,7 @@ def run_testing_inference(
                 ),
                 "label_logits": _dict_from_row(label_logits[row_index], artifacts.label_classes),
                 "subcategory_logits": subcategory_logits,
+                "subcategory_coverage": subcategory_coverage,
                 "top_contributions": contributions_for_prediction,
                 "top_contributing_features": contributions_for_prediction,
                 "high_risk": bool(max_probability >= risk_threshold),
@@ -1007,6 +1050,7 @@ def write_testing_outputs(
                 "ensemble": record["label_logits"],
                 "by_label_subcategory": record["subcategory_logits"],
             },
+            "subcategory_coverage": record["subcategory_coverage"],
             "top_contributing_features": record["top_contributing_features"],
             **(
                 {"source_log_id": record["source_log_id"]}

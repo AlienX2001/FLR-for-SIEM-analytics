@@ -25,6 +25,7 @@ from federated_lr_pipeline.specialized_models import (
     evaluate_hierarchical_ensemble,
     generate_hierarchical_predictions,
     initialize_all_specialists,
+    representation_ambiguity_diagnostics,
     save_hierarchical_artifacts,
     train_specialist_round,
     write_hierarchical_inference_outputs,
@@ -176,6 +177,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             "ensemble": {
                 "fusion": hierarchy.fusion,
                 "fusion_mode": hierarchy.fusion_mode,
+                "coverage_aware": hierarchy.coverage_aware,
             },
         },
     )
@@ -192,6 +194,26 @@ def run_pipeline(config: PipelineConfig) -> None:
         prf_key=prf_key,
     )
     token_counters_by_subcategory = build_subcategory_token_counters(texts_by_subcategory)
+    LOGGER.info("Measuring conflicting labels for identical training representations")
+    representation_diagnostics = representation_ambiguity_diagnostics(
+        org_datasets=org_datasets,
+        splits=splits,
+        token_counters_by_subcategory=token_counters_by_subcategory,
+        subcategories=active_subcategories,
+    )
+    write_json(
+        output_dir / "representation_diagnostics.json",
+        representation_diagnostics,
+    )
+    for org_metrics in representation_diagnostics["per_org"]:
+        attack_metrics = org_metrics["non_benign_training_rows"]
+        if attack_metrics["ambiguous_row_fraction"] > 0:
+            LOGGER.warning(
+                "Organization %s has %.2f%% of non-benign training rows in "
+                "representations associated with multiple labels",
+                org_metrics["org_index"],
+                100.0 * attack_metrics["ambiguous_row_fraction"],
+            )
 
     LOGGER.info("Initializing label/subcategory vocabularies and specialists")
     specialists = initialize_all_specialists(
@@ -212,6 +234,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         weights_by_label={
             label: branch.weights for label, branch in hierarchy.branches.items()
         },
+        coverage_aware=hierarchy.coverage_aware,
     )
 
     metrics_by_round: list[dict[str, object]] = []
@@ -300,7 +323,13 @@ def run_pipeline(config: PipelineConfig) -> None:
             },
             "aggregation": {"weighting": config.aggregation_weighting},
             "class_weight": {"mode": config.class_weight},
+            "fusion": {
+                "mode": hierarchy.fusion_mode,
+                "coverage_aware": hierarchy.coverage_aware,
+            },
+            "context_features": run_config_payload["cross_context"],
             "vocabulary_source": config.vocabulary_source,
+            "representation_diagnostics": representation_diagnostics,
             "rounds": metrics_by_round,
         },
     )

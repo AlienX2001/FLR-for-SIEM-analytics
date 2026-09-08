@@ -36,8 +36,8 @@ def test_cross_vocabulary_is_balanced_without_partial_groups() -> None:
     right_counts = Counter(right for _, _, right, _ in CROSS_TOKEN_SPECS)
     scope_counts = Counter(scope for _, _, _, scope in CROSS_TOKEN_SPECS)
 
-    assert left_counts == Counter({signal: 200 for signal in CROSS_LEFT_SIGNALS})
-    assert right_counts == Counter({signal: 50 for signal in CROSS_RIGHT_SIGNALS})
+    assert left_counts == Counter({signal: 100 for signal in CROSS_LEFT_SIGNALS})
+    assert right_counts == Counter({signal: 100 for signal in CROSS_RIGHT_SIGNALS})
     assert scope_counts == Counter({scope: 100 for scope in CROSS_VOCABULARY_SCOPES})
 
 

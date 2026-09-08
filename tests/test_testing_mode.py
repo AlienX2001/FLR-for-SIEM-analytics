@@ -142,6 +142,7 @@ def test_testing_mode_skips_training_and_writes_metrics(tmp_path: Path, monkeypa
     assert "true_label" in first_prediction
     assert "ensemble_predicted_label" in first_prediction
     assert "correct" in first_prediction
+    assert "subcategory_coverage" in first_prediction
 
     explanations = (output_dir / "testing_explanations.jsonl").read_text().splitlines()
     assert explanations
@@ -189,6 +190,24 @@ def test_testing_mode_validates_pretrained_model_shapes(tmp_path: Path) -> None:
     np.save(artifact_dir / "final_benign_system_weights.npy", np.zeros(len(tags) + 1))
 
     with pytest.raises(ValueError, match="shape mismatch"):
+        run_pipeline(
+            _testing_config(
+                org_logs=org_logs,
+                org_labels=org_labels,
+                artifact_dir=artifact_dir,
+                output_dir=tmp_path / "testing",
+            )
+        )
+
+
+def test_testing_mode_rejects_incompatible_numeric_bucketing(tmp_path: Path) -> None:
+    org_logs, org_labels, artifact_dir = _train_small_model(tmp_path)
+    run_config_path = artifact_dir / "run_config.json"
+    run_config = json.loads(run_config_path.read_text())
+    run_config["numeric_bucketing"]["version"] = -1
+    run_config_path.write_text(json.dumps(run_config))
+
+    with pytest.raises(ValueError, match="incompatible numeric feature encoding"):
         run_pipeline(
             _testing_config(
                 org_logs=org_logs,
