@@ -95,7 +95,7 @@ tags are absent from the global vocabulary are ignored because the federated mod
 has no trained coefficient for them. Global weights are stored in TF coordinates,
 so inference does not fit or transmit query-time IDF statistics.
 
-Testing mode derives the prototype PRF key from the saved training seed and
+Inference mode derives the prototype PRF key from the saved training seed and
 requires `prf_namespace.format` to be `subcategory|token`. The PRF operation is
 performed locally; plaintext query tokens are not required by the server. In a
 production deployment, key derivation from a public run seed should be replaced
@@ -286,11 +286,11 @@ conda run -n LR python -m ioc_generation.run \
   --output-dir outputs/run_001/iocs
 ```
 
-Run inference-only testing from a previously trained artifact directory:
+Run inference-only evaluation from a previously trained artifact directory:
 
 ```bash
 conda run -n LR python -m federated_lr_pipeline.run \
-  --testing \
+  --inference \
   --org-data examples/orgA_logs.csv examples/orgB_logs.csv examples/orgC_logs.csv \
   --org-groundtruth examples/orgA_groundtruth.csv examples/orgB_groundtruth.csv examples/orgC_groundtruth.csv \
   --label-column "Tactic Name" \
@@ -299,7 +299,7 @@ conda run -n LR python -m federated_lr_pipeline.run \
   --output-dir outputs/test_run_001
 ```
 
-Testing mode loads saved specialist weights, global PRF-tag vocabularies, per-organization index vectors, label classes, fusion metadata, benign novelty baselines, and the training-time cross-context settings. It does not regenerate vocabularies, train local models, aggregate parameters, initialize new models, or write new trained weights. Testing from raw logs requires saved local vocabulary tokens; run the training job with `--debug-plaintext-vocab` when you need later standalone testing from CSV inputs. When the hierarchy uses cross specialists, testing rejects older artifact directories that do not contain compatible cross-context and benign-baseline metadata because their features cannot be reproduced exactly.
+Inference mode loads saved specialist weights, global PRF-tag vocabularies, per-organization index vectors, label classes, fusion metadata, benign novelty baselines, and the training-time cross-context settings. It does not regenerate vocabularies, train local models, aggregate parameters, initialize new models, or write new trained weights. Inference from raw logs requires saved local vocabulary tokens; run the training job with `--debug-plaintext-vocab` when you need later standalone inference from CSV inputs. When the hierarchy uses cross specialists, inference rejects older artifact directories that do not contain compatible cross-context and benign-baseline metadata because their features cannot be reproduced exactly.
 
 ## Output Files
 
@@ -328,7 +328,8 @@ Specialist artifacts are written per label/subcategory, for example:
 
 When `--debug-plaintext-vocab` is enabled, local debug token files are also written.
 
-Testing mode writes only testing outputs:
+Inference mode writes only inference-evaluation outputs (the existing
+`testing_*` filenames are retained for compatibility):
 
 - `testing_run_config.json`
 - `testing_metrics.json`

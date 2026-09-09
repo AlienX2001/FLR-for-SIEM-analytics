@@ -204,7 +204,7 @@ def _apply_testing_fusion_override(
         weights_by_label[label]["bias"] = 0.0
 
     LOGGER.info(
-        "Testing mode overriding saved fusion with %s",
+        "Inference mode overriding saved fusion with %s",
         config.ensemble_method,
     )
     return ManualLogitFusion(
@@ -1072,10 +1072,10 @@ def _effective_risk_threshold(config: PipelineConfig, run_config: dict[str, Any]
 def run_testing_mode(config: PipelineConfig) -> None:
     setup_logging()
     for flag in config.testing_ignored_parameters:
-        LOGGER.warning("Ignoring training parameter %s in --testing mode", flag)
+        LOGGER.warning("Ignoring training parameter %s in --inference mode", flag)
 
     output_dir = ensure_dir(config.output_dir)
-    LOGGER.info("Loading row-aligned organization data for testing")
+    LOGGER.info("Loading row-aligned organization data for inference evaluation")
     org_datasets = load_all_orgs(
         config.org_data,
         config.org_groundtruth,

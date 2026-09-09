@@ -114,7 +114,7 @@ def test_testing_mode_skips_training_and_writes_metrics(tmp_path: Path, monkeypa
     output_dir = tmp_path / "testing"
 
     def fail_if_training(*args, **kwargs):  # noqa: ANN002, ANN003
-        raise AssertionError("testing mode must not call train_specialist_round")
+        raise AssertionError("inference mode must not call train_specialist_round")
 
     monkeypatch.setattr(run_module, "train_specialist_round", fail_if_training)
 
@@ -221,7 +221,7 @@ def test_testing_mode_rejects_incompatible_numeric_bucketing(tmp_path: Path) -> 
 def test_testing_mode_parser_ignores_training_only_parameters() -> None:
     config = parse_args(
         [
-            "--testing",
+            "--inference",
             "--org-data",
             "logs.csv",
             "--org-groundtruth",

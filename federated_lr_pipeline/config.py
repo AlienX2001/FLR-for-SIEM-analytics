@@ -115,7 +115,7 @@ class PipelineConfig:
 
 def _prompt_path_list(prompt: str, parser: argparse.ArgumentParser) -> list[Path]:
     if not sys.stdin.isatty():
-        parser.error(f"{prompt} is required in --testing mode when stdin is not interactive")
+        parser.error(f"{prompt} is required in --inference mode when stdin is not interactive")
     raw_value = input(f"{prompt}, comma-separated: ").strip()
     values = [item.strip() for item in raw_value.split(",") if item.strip()]
     if not values:
@@ -125,7 +125,7 @@ def _prompt_path_list(prompt: str, parser: argparse.ArgumentParser) -> list[Path
 
 def _prompt_path(prompt: str, parser: argparse.ArgumentParser) -> Path:
     if not sys.stdin.isatty():
-        parser.error(f"{prompt} is required in --testing mode when stdin is not interactive")
+        parser.error(f"{prompt} is required in --inference mode when stdin is not interactive")
     raw_value = input(f"{prompt}: ").strip()
     if not raw_value:
         parser.error(f"{prompt} cannot be empty")
@@ -142,7 +142,7 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
     parser = argparse.ArgumentParser(
         description="Privacy-preserving federated logistic regression prototype."
     )
-    parser.add_argument("--testing", action="store_true")
+    parser.add_argument("--inference", dest="testing", action="store_true")
     parser.add_argument("--org-data", nargs="+", type=Path)
     parser.add_argument("--org-groundtruth", nargs="+", type=Path)
     parser.add_argument("--num-features", type=int)
@@ -236,7 +236,7 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         "--model-artifact-dir",
         default=None,
         type=Path,
-        help="Directory containing trained artifacts for --testing mode.",
+        help="Directory containing trained artifacts for --inference mode.",
     )
     parser.add_argument("--network-weights", default=None, type=Path)
     parser.add_argument("--network-bias", default=None, type=Path)
@@ -261,7 +261,7 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         "--ensemble-method",
         choices=("average_logits", "weighted_average_logits"),
         default=None,
-        help="Testing-only override for subcategory logit fusion.",
+        help="Inference-only override for subcategory logit fusion.",
     )
     parser.add_argument("--network-logit-weight", default=1.0, type=float)
     parser.add_argument("--system-logit-weight", default=1.0, type=float)
@@ -368,7 +368,7 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         parser.error("--use-global-model is reserved for compatibility and is not implemented")
     if args.testing and args.model_artifact_dir is None and args.hierarchical_model_manifest is None:
         parser.error(
-            "--testing requires --model-artifact-dir or --hierarchical-model-manifest"
+            "--inference requires --model-artifact-dir or --hierarchical-model-manifest"
         )
 
     training_flags = {
