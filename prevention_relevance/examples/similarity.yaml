@@ -1,0 +1,80 @@
+version: 1
+
+# Set true in an operational run unless the input bundle is already curated.
+require_validated: false
+include_feature_tokens: true
+
+similarity:
+  component_weights:
+    direct: 0.45
+    node: 0.15
+    edge: 0.25
+    context: 0.15
+  type_weights:
+    domain: 3.0
+    ip_address: 2.5
+    process: 2.0
+    process_path: 2.5
+    file_path: 2.5
+    port: 0.7
+    protocol: 0.4
+    platform: 1.5
+  match_scores:
+    exact: 1.0
+    network_membership: 0.9
+    process_basename: 0.7
+    url_host: 0.65
+  high_threshold: 0.40
+  review_threshold: 0.20
+  incompatibility_weight: 0.25
+  ego_hops: 2
+  min_distinctive_matches: 1
+
+# Values listed here cannot satisfy the distinctive-evidence gate by themselves.
+generic_values:
+  protocol: [tcp, udp]
+  port: [53, 80, 443]
+  process: [sh, bash, cmd.exe]
+
+# Aliases are used only to compare graph-edge semantics.
+relation_aliases:
+  runs: [executes, uses_process]
+  connects_to: [communicates_with, contacts]
+  uses_port: [destination_port, listens_on]
+  uses_protocol: [protocol]
+  accesses: [reads, writes]
+
+# These requirements add deployment context to Indicators carrying the matching
+# x_federated_lr_predicted_label. They are administrator-defined hypotheses.
+attack_applicability:
+  credential access:
+    platform: [windows, linux]
+    process: [powershell.exe, ssh]
+  data exfiltration:
+    protocol: [https, tls]
+    port: [443]
+  lateral movement:
+    process: [ssh, powershell.exe]
+    port: [22, 445, 3389]
+
+# Field aliases are ordered. The first nonempty value is used unless multiple
+# aliases contain conflicting values, in which case that logical field is skipped.
+field_mappings:
+  host: [host, hostname, computer_name, Computer, device_id]
+  platform: [platform, os, os_name, host_os, EventData.HostOSName]
+  process: [process_name, process, image_name]
+  process_path: [process_exe, process_path, executable_path, image_path]
+  parent_process: [parent_process, parent_image, process_parent_name]
+  file_path: [file_path, path, target_file, object_name]
+  identity: [user, username, user_uid, account_name, principal]
+  source_ip: [src_ip, source_ip, local_ip, local_address]
+  destination_ip: [dst_ip, destination_ip, remote_ip, remote_address]
+  domain: [domain, destination_domain, dns_query, http_host, tls_sni, sni]
+  url: [url, uri, http_uri, request_url, download_url]
+  protocol: [protocol_name, protocol, proto, transport_protocol]
+  source_port: [src_port, source_port, local_port]
+  destination_port: [dst_port, destination_port, remote_port]
+  direction: [network_direction, direction, traffic_direction]
+  md5: [md5]
+  sha1: [sha1, sha_1]
+  sha256: [sha256, sha_256, file_hash]

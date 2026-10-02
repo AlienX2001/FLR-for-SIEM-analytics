@@ -85,3 +85,92 @@ def test_ioc_generation_does_not_emit_structured_metadata_or_url_path_iocs(
     assert "[file:hashes.'MD5' = '368c710a8a0a763186eab09971d12717']" not in patterns
     assert "[domain-name:value = '-300x168.jpg']" not in patterns
     assert "[ipv4-addr:value = '1.0.0.0']" not in patterns
+
+
+def test_single_org_data_accepts_retained_nonzero_org_index(tmp_path: Path) -> None:
+    logs_path = tmp_path / "org_1_logs.csv"
+    pd.DataFrame(
+        {
+            "message": ["connection to 203.0.113.10"],
+            "log_id": ["source-1"],
+        }
+    ).to_csv(logs_path, index=False)
+    high_risk_path = tmp_path / "high_risk.jsonl"
+    explanations_path = tmp_path / "explanations.jsonl"
+    write_jsonl(
+        high_risk_path,
+        [
+            {
+                "org_index": 1,
+                "row_index": 0,
+                "internal_log_id": "org_1_row_0",
+                "ensemble_predicted_label": "credential access",
+                "ensemble_max_risk_probability": 0.9,
+            }
+        ],
+    )
+    write_jsonl(
+        explanations_path,
+        [{"internal_log_id": "org_1_row_0", "top_contributions": {}}],
+    )
+
+    output_dir = tmp_path / "iocs"
+    generate_ioc_outputs(
+        high_risk_logs=high_risk_path,
+        explanations=explanations_path,
+        org_data=[logs_path],
+        output_dir=output_dir,
+    )
+
+    records = [
+        json.loads(line)
+        for line in (output_dir / "ioc_records.jsonl").read_text().splitlines()
+    ]
+    assert records[0]["org_index"] == 1
+    assert records[0]["internal_log_id"] == "org_1_row_0"
+    assert records[0]["source_log_id"] == "source-1"
+
+
+def test_explicit_org_indexes_map_noncontiguous_subset(tmp_path: Path) -> None:
+    org_1 = tmp_path / "org_1.csv"
+    org_4 = tmp_path / "org_4.csv"
+    pd.DataFrame({"message": ["203.0.113.1"]}).to_csv(org_1, index=False)
+    pd.DataFrame({"message": ["203.0.113.4"]}).to_csv(org_4, index=False)
+    high_risk_path = tmp_path / "high_risk.jsonl"
+    explanations_path = tmp_path / "explanations.jsonl"
+    write_jsonl(
+        high_risk_path,
+        [
+            {
+                "org_index": 0,
+                "row_index": 0,
+                "internal_log_id": "org_0_row_0",
+                "predicted_label": "credential access",
+                "max_risk_probability": 0.9,
+            },
+            {
+                "org_index": 4,
+                "row_index": 0,
+                "internal_log_id": "org_4_row_0",
+                "predicted_label": "credential access",
+                "max_risk_probability": 0.9,
+            }
+        ],
+    )
+    write_jsonl(explanations_path, [])
+
+    output_dir = tmp_path / "iocs"
+    generate_ioc_outputs(
+        high_risk_logs=high_risk_path,
+        explanations=explanations_path,
+        org_data=[org_1, org_4],
+        org_indexes=[1, 4],
+        output_dir=output_dir,
+    )
+
+    records = [
+        json.loads(line)
+        for line in (output_dir / "ioc_records.jsonl").read_text().splitlines()
+    ]
+    assert {record["indicator_value"] for record in records} == {"203.0.113.4"}
+    assert all(record["org_index"] == 4 for record in records)

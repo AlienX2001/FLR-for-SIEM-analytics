@@ -1,0 +1,3 @@
+host,platform,src_ip,dst_ip,dst_port,protocol_name,network_direction,domain
+NEW-WIN-01,windows,10.20.10.21,203.0.113.20,443,tcp,outbound,updates.example.com
+NEW-LINUX-01,linux,10.20.10.22,198.51.100.40,22,tcp,outbound,admin.example.net

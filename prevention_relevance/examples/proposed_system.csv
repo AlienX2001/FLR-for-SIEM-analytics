@@ -1,0 +1,3 @@
+host,platform,process_name,process_exe,parent_process,file_path,user_uid
+NEW-WIN-01,windows,powershell.exe,C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe,explorer.exe,C:\Finance\quarterly.xlsx,S-1-5-21-1000
+NEW-LINUX-01,linux,sshd,/usr/sbin/sshd,systemd,/etc/ssh/sshd_config,1001

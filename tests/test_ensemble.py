@@ -80,3 +80,30 @@ def test_coverage_aware_fusion_omits_uncovered_specialists() -> None:
     fused = fusion.predict_logits(logits, coverage_by_label=coverage)
 
     np.testing.assert_allclose(fused, np.array([[0.0, 1.0]]))
+
+
+def test_fuse_all_specialists_ignores_coverage_masks() -> None:
+    fusion = ManualLogitFusion(
+        labels=["a"],
+        subcategories_by_label={"a": ["system", "network"]},
+        weights_by_label={
+            "a": {"bias": -1.0, "system": 1.0, "network": 2.0}
+        },
+        coverage_aware=False,
+    )
+    logits = {
+        "a": {
+            "system": np.array([3.0]),
+            "network": np.array([5.0]),
+        }
+    }
+    coverage = {
+        "a": {
+            "system": np.array([True]),
+            "network": np.array([False]),
+        }
+    }
+
+    fused = fusion.predict_logits(logits, coverage_by_label=coverage)
+
+    np.testing.assert_allclose(fused, np.array([[12.0]]))

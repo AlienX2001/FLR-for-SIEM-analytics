@@ -10,7 +10,9 @@ import pytest
 import federated_lr_pipeline.run as run_module
 from federated_lr_pipeline.config import PipelineConfig
 from federated_lr_pipeline.config import parse_args
+from federated_lr_pipeline.ensemble import ManualLogitFusion
 from federated_lr_pipeline.run import run_pipeline
+from federated_lr_pipeline.testing import _apply_testing_fusion_override
 
 
 def _write_testing_org(tmp_path: Path, org_name: str) -> tuple[Path, Path]:
@@ -109,6 +111,46 @@ def _testing_config(
     )
 
 
+def test_fuse_all_specialists_cli_flag_disables_coverage_awareness() -> None:
+    config = parse_args(
+        [
+            "--org-data",
+            "logs.csv",
+            "--org-groundtruth",
+            "labels.csv",
+            "--num-features",
+            "10",
+            "--federation-iterations",
+            "1",
+            "--output-dir",
+            "output",
+            "--fuse-all-specialists",
+        ]
+    )
+    assert config.coverage_aware_fusion is False
+
+
+def test_inference_override_can_fuse_all_saved_specialists(tmp_path: Path) -> None:
+    fusion = ManualLogitFusion(
+        labels=["benign"],
+        subcategories_by_label={"benign": ["system", "network"]},
+        weights_by_label={"benign": {"system": 1.0, "network": 1.0}},
+        coverage_aware=True,
+    )
+    config = PipelineConfig(
+        org_data=[tmp_path / "logs.csv"],
+        org_groundtruth=[tmp_path / "labels.csv"],
+        num_features=0,
+        federation_iterations=0,
+        testing=True,
+        coverage_aware_fusion=False,
+    )
+
+    overridden = _apply_testing_fusion_override(fusion, config)
+
+    assert overridden.coverage_aware is False
+
+
 def test_testing_mode_skips_training_and_writes_metrics(tmp_path: Path, monkeypatch) -> None:
     org_logs, org_labels, artifact_dir = _train_small_model(tmp_path)
     output_dir = tmp_path / "testing"
@@ -150,6 +192,32 @@ def test_testing_mode_skips_training_and_writes_metrics(tmp_path: Path, monkeypa
     assert "true_label" in first_explanation
     assert "ensemble_predicted_label" in first_explanation
     assert "top_contributing_features" in first_explanation
+
+
+def test_testing_mode_auto_maps_single_saved_organization_subset(
+    tmp_path: Path,
+) -> None:
+    org_logs, org_labels, artifact_dir = _train_small_model(tmp_path)
+    output_dir = tmp_path / "org_1_only"
+
+    run_pipeline(
+        _testing_config(
+            org_logs=[org_logs[1]],
+            org_labels=[org_labels[1]],
+            artifact_dir=artifact_dir,
+            output_dir=output_dir,
+        )
+    )
+
+    records = [
+        json.loads(line)
+        for line in (output_dir / "testing_predictions.jsonl").read_text().splitlines()
+    ]
+    assert records
+    assert {record["org_index"] for record in records} == {1}
+    assert all(record["internal_log_id"].startswith("org_1_row_") for record in records)
+    testing_config = json.loads((output_dir / "testing_run_config.json").read_text())
+    assert testing_config["resolved_org_indices"] == [1]
 
 
 def test_testing_mode_missing_artifact_has_clear_error(tmp_path: Path, monkeypatch) -> None:

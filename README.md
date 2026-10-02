@@ -286,6 +286,11 @@ conda run -n LR python -m ioc_generation.run \
   --output-dir outputs/run_001/iocs
 ```
 
+When processing only one organization whose saved records retain a nonzero
+`org_index`, the sole `--org-data` file is mapped automatically. For an
+arbitrary multi-organization subset, specify one original index per input file,
+for example `--org-indexes 1 4` alongside two `--org-data` paths.
+
 Run inference-only evaluation from a previously trained artifact directory:
 
 ```bash
@@ -300,6 +305,24 @@ conda run -n LR python -m federated_lr_pipeline.run \
 ```
 
 Inference mode loads saved specialist weights, global PRF-tag vocabularies, per-organization index vectors, label classes, fusion metadata, benign novelty baselines, and the training-time cross-context settings. It does not regenerate vocabularies, train local models, aggregate parameters, initialize new models, or write new trained weights. Inference from raw logs requires saved local vocabulary tokens; run the training job with `--debug-plaintext-vocab` when you need later standalone inference from CSV inputs. When the hierarchy uses cross specialists, inference rejects older artifact directories that do not contain compatible cross-context and benign-baseline metadata because their features cannot be reproduced exactly.
+
+Inference may evaluate only a subset of the organizations represented by an
+artifact directory. Inputs whose log and groundtruth paths match the saved
+training paths are mapped automatically. If files were renamed or relocated,
+pass their original artifact indices explicitly, for example
+`--org-indexes 1` for only the second training organization.
+
+Coverage-aware fusion is enabled by default and suppresses a specialist's logit
+when the row has no projected evidence for that subcategory. For an ablation
+that fuses every configured specialist regardless of evidence coverage, add:
+
+```bash
+--fuse-all-specialists
+```
+
+The alias `--disable-coverage-aware-fusion` has the same behavior. The flag can
+be used in both training and `--inference` commands; inference otherwise uses
+the coverage mode saved with the trained model.
 
 ## Output Files
 
@@ -350,3 +373,22 @@ IoC extraction prioritizes populated structured indicator fields such as source
 and destination IPs, domains, SNI, URLs, and hashes. It scans the configured free
 text column only when none of those structured fields is populated, preventing a
 duplicated narrative field from overriding authoritative structured values.
+
+## Preventive Relevance Experiment
+
+The standalone `prevention_relevance` package compares historical STIX
+Indicators with a typed graph built from sample logs for a proposed environment:
+
+```bash
+conda run -n LR python -m prevention_relevance.run \
+  --proposed-system-logs prevention_relevance/examples/proposed_system.csv \
+  --proposed-network-logs prevention_relevance/examples/proposed_network.csv \
+  --ioc-bundle prevention_relevance/examples/example_ioc_bundle.json \
+  --config prevention_relevance/examples/similarity.yaml \
+  --output-dir outputs/prevention-example
+```
+
+It reuses the federated pipeline's field-aware preprocessing, performs typed
+node/edge/context matching, and emits auditable IoC relevance rankings. See
+[`prevention_relevance/README.md`](prevention_relevance/README.md) for the graph
+schema, scoring equations, optional analyst-label evaluation, and limitations.

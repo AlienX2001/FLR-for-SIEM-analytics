@@ -2251,6 +2251,7 @@ def build_hierarchical_config(
     config_path: Path | None,
     *,
     fusion_mode: str,
+    coverage_aware_override: bool | None = None,
 ) -> HierarchicalModelConfig:
     payload = _load_hierarchical_payload(config_path)
     label_payload = payload.get("labels", {})
@@ -2259,6 +2260,8 @@ def build_hierarchical_config(
     coverage_aware = ensemble_payload.get("coverage_aware", True)
     if not isinstance(coverage_aware, bool):
         raise ValueError("ensemble.coverage_aware must be a boolean")
+    if coverage_aware_override is not None:
+        coverage_aware = coverage_aware_override
     labels = [label for label in observed_labels if label in observed_labels]
     branches: dict[str, LabelBranchConfig] = {}
 

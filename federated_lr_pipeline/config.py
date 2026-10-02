@@ -42,12 +42,14 @@ class PipelineConfig:
     vocabulary_source: str = "train"
     aggregation_weighting: str = "sample_size"
     fusion_mode: str = "manual"
+    coverage_aware_fusion: bool | None = None
     use_global_model: bool = False
     debug_plaintext_vocab: bool = False
     context_window_minutes: float = 15.0
     context_timestamp_epoch_field: str | None = "event_time_epoch"
     context_timestamp_iso_field: str | None = "event_time_iso"
     testing: bool = False
+    org_indexes: list[int] | None = None
     model_artifact_dir: Path | None = None
     network_weights: Path | None = None
     network_bias: Path | None = None
@@ -145,6 +147,17 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
     parser.add_argument("--inference", dest="testing", action="store_true")
     parser.add_argument("--org-data", nargs="+", type=Path)
     parser.add_argument("--org-groundtruth", nargs="+", type=Path)
+    parser.add_argument(
+        "--org-indexes",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Inference-only original artifact organization index for each "
+            "--org-data/--org-groundtruth pair. Paths matching the saved training "
+            "run are mapped automatically."
+        ),
+    )
     parser.add_argument("--num-features", type=int)
     parser.add_argument("--federation-iterations", type=int)
     parser.add_argument("--min-df", default=2, type=int)
@@ -202,6 +215,19 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         choices=("manual", "meta"),
         default="manual",
         help="Manual logit fusion is implemented; meta is reserved for later.",
+    )
+    parser.add_argument(
+        "--fuse-all-specialists",
+        "--disable-coverage-aware-fusion",
+        dest="coverage_aware_fusion",
+        action="store_const",
+        const=False,
+        default=None,
+        help=(
+            "Experimental ablation: ignore evidence-coverage masks and fuse every "
+            "specialist configured for each label. Coverage-aware fusion remains "
+            "the default."
+        ),
     )
     parser.add_argument(
         "--use-global-model",
@@ -311,6 +337,17 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
 
     if len(args.org_data) != len(args.org_groundtruth):
         parser.error("--org-data and --org-groundtruth must contain the same number of files")
+    if args.org_indexes is not None:
+        if not args.testing:
+            parser.error("--org-indexes is only supported with --inference")
+        if len(args.org_indexes) != len(args.org_data):
+            parser.error(
+                "--org-indexes must contain exactly one index per organization input pair"
+            )
+        if any(index < 0 for index in args.org_indexes):
+            parser.error("--org-indexes values must be non-negative")
+        if len(set(args.org_indexes)) != len(args.org_indexes):
+            parser.error("--org-indexes values must be unique")
     if args.text_column is not None and args.text_columns is not None:
         parser.error("Use either --text-column or --text-columns, not both")
     if not args.testing and args.num_features is not None and args.num_features <= 0:
@@ -392,6 +429,8 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         "--system-logit-weight",
         "--inter-logit-weight",
         "--debug-plaintext-vocab",
+        "--fuse-all-specialists",
+        "--disable-coverage-aware-fusion",
     }
     ignored_testing_parameters = sorted(training_flags & provided_flags) if args.testing else []
     testing_override_parameters = sorted(testing_override_flags & provided_flags)
@@ -423,6 +462,7 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         vocabulary_source=args.vocabulary_source,
         aggregation_weighting=args.aggregation_weighting,
         fusion_mode=args.fusion_mode,
+        coverage_aware_fusion=args.coverage_aware_fusion,
         use_global_model=args.use_global_model,
         debug_plaintext_vocab=args.debug_plaintext_vocab,
         context_window_minutes=args.context_window_minutes,
@@ -437,6 +477,7 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
             else None
         ),
         testing=args.testing,
+        org_indexes=args.org_indexes,
         model_artifact_dir=args.model_artifact_dir,
         network_weights=args.network_weights,
         network_bias=args.network_bias,

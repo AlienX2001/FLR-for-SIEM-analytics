@@ -163,6 +163,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         label_classes,
         config.hierarchical_config,
         fusion_mode=config.fusion_mode,
+        coverage_aware_override=config.coverage_aware_fusion,
     )
     write_json(
         output_dir / "hierarchical_config.json",

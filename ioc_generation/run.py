@@ -17,6 +17,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--high-risk-logs", required=True, type=Path)
     parser.add_argument("--explanations", required=True, type=Path)
     parser.add_argument("--org-data", nargs="+", required=True, type=Path)
+    parser.add_argument(
+        "--org-indexes",
+        nargs="+",
+        type=int,
+        help=(
+            "Optional original organization index for each --org-data file. "
+            "Useful when processing a non-contiguous subset of organizations."
+        ),
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--text-column", default=None)
     return parser.parse_args(argv)
@@ -36,6 +45,7 @@ def main(argv: list[str] | None = None) -> None:
         org_data=args.org_data,
         output_dir=output_dir,
         text_column=args.text_column,
+        org_indexes=args.org_indexes,
     )
     LOGGER.info("Wrote IoC outputs to %s", output_dir)
 

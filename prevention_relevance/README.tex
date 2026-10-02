@@ -1,0 +1,120 @@
+\section{Collective-Intelligence Prevention Relevance}
+\label{sec:prevention-relevance}
+
+The \texttt{prevention\_relevance} module evaluates whether historical threat
+intelligence is applicable to a proposed organizational change. It represents
+sample system and network telemetry for the proposed deployment as a typed
+graph $G_{\mathrm{new}}$, converts historical STIX Indicators and their context
+into candidate graphs, and ranks those Indicators using an interpretable graph
+similarity score. The output supports analyst review; relevance does not prove
+that an environment is vulnerable, compromised, or malicious.
+
+\subsection{Inputs and Processing}
+
+The proposed-change input consists of one or more CSV files containing
+representative system or network events. The module reuses the field-aware
+preprocessing functions of the federated pipeline, specifically
+\texttt{field\_aware\_tokens()} and \texttt{\_row\_text()} from
+\texttt{federated\_lr\_pipeline.specialized\_models}. It does not fit a model,
+build a vocabulary, or invoke federated inference.
+
+Each resolved value becomes a typed graph node, for example a platform,
+process, file path, IP address, domain, protocol, or port. Relations encode
+observed structure, including \texttt{runs}, \texttt{accesses},
+\texttt{connects\_to}, \texttt{uses\_protocol}, and \texttt{uses\_port}.
+Canonical values produce deterministic node and edge identifiers. CSV aliases
+are defined in YAML/JSON configuration; conflicting populated aliases are
+omitted conservatively.
+
+The historical input may be a STIX Bundle, a JSON list/object, or JSONL STIX
+objects. Exact STIX equality patterns for IP addresses, domains, URLs, email
+addresses, vulnerabilities, and common file hashes are converted to observable
+nodes. Optional IoC records and model explanations link Indicators to attack
+classes, source events, evidence categories, and field-aware features.
+
+\subsection{Typed Similarity}
+
+Let $C_j$ be the ego graph of Indicator $j$, let $N$ be the number of candidate
+Indicators, and let $\operatorname{df}(u)$ be the number of candidate graphs
+containing node $u$. A candidate node receives weight
+\begin{equation}
+ w(u)=w_{\operatorname{type}(u)}
+ \left[
+ \log\left(\frac{N+1}{\operatorname{df}(u)+1}\right)+1
+ \right].
+\end{equation}
+This reduces the influence of evidence shared by many candidates.
+
+The node-coverage component is
+\begin{equation}
+ S_{\mathrm{node}}(C_j,G_{\mathrm{new}})=
+ \frac{
+ \sum_{u\in C_j}w(u)\max_{v\in G_{\mathrm{new}}}
+ \operatorname{sim}(u,v)
+ }{
+ \sum_{u\in C_j}w(u)
+ }.
+\end{equation}
+The typed similarity function supports exact canonical equality,
+IP-in-network membership, process/path basename agreement, and URL-host/domain
+agreement. The edge component $S_{\mathrm{edge}}$ applies an analogous weighted
+coverage calculation to relation-equivalent edges, using the product of the
+two endpoint similarities. $S_{\mathrm{direct}}$ equals one when the exact
+observable named by the Indicator occurs in $G_{\mathrm{new}}$; otherwise it is
+zero. $S_{\mathrm{context}}$ measures configured attack-class applicability,
+such as platform, process, protocol, or port requirements.
+
+The final score is
+\begin{equation}
+ S_j=\operatorname{clip}_{[0,1]}\left(
+ \alpha_dS_{\mathrm{direct}}+
+ \alpha_nS_{\mathrm{node}}+
+ \alpha_eS_{\mathrm{edge}}+
+ \alpha_cS_{\mathrm{context}}-
+ \lambda I_{\mathrm{platform}}
+ \right),
+\end{equation}
+where $I_{\mathrm{platform}}$ identifies an explicit platform incompatibility
+and the $\alpha$ values are normalized configuration weights. Unless an exact
+direct observable matches, a candidate must satisfy a distinctive-evidence
+gate and have edge or contextual support. Consequently, generic evidence such
+as TCP or port 443 cannot select an Indicator by itself.
+
+Scores above the high threshold are marked \texttt{relevant}; scores in the
+lower review band are marked \texttt{analyst\_review}; all others are
+\texttt{not\_selected}. A separate priority score incorporates Indicator
+validation status and an available model risk probability for ordering, but it
+does not change the architectural relevance score.
+
+\subsection{Execution}
+
+\begin{verbatim}
+conda run -n LR python -m prevention_relevance.run \
+  --proposed-system-logs proposed/system.csv \
+  --proposed-network-logs proposed/network.csv \
+  --ioc-bundle outputs/run_001/iocs/ioc_bundle.json \
+  --ioc-records outputs/run_001/iocs/ioc_records.jsonl \
+  --explanations outputs/run_001/explanations.jsonl \
+  --config prevention_relevance/examples/similarity.yaml \
+  --output-dir outputs/prevention-run
+\end{verbatim}
+
+The command writes $G_{\mathrm{new}}$, the historical graph, CSV and JSONL
+rankings, per-Indicator explanations, a run summary, and the resolved
+configuration. Historical-graph serialization may be disabled for large
+bundles. If an analyst label file with columns \texttt{indicator\_id} and
+\texttt{relevant} is supplied, the module additionally reports classification
+and ranking metrics, including precision, recall, F1, average precision, ROC
+AUC, NDCG, and precision/recall at $k$.
+
+\subsection{Interpretation and Limitations}
+
+The analysis is deterministic and performs no DNS resolution, online lookup,
+fuzzy matching, or graph embedding. Its quality depends on the completeness of
+the proposed-change telemetry, the STIX context, and administrator-defined
+applicability mappings. An exact overlap or high similarity indicates that
+historical intelligence should be reviewed when planning monitoring or
+controls; it is not evidence that the proposed deployment is benign or
+malicious. Unreviewed IoCs and administrative applicability assumptions must
+remain subject to human validation.
+

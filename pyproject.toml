@@ -25,6 +25,7 @@ include = [
   "ioc_generation*",
   "policy_filter*",
   "behaviour_profiling*",
+  "prevention_relevance*",
 ]
 
 [tool.pytest.ini_options]

@@ -54,6 +54,7 @@ class TestingArtifacts:
     label_classes: list[str]
     specialists: dict[str, dict[str, SpecialistState]]
     fusion: ManualLogitFusion
+    org_indices: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,67 @@ class TestingInferenceResult:
 def _read_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _path_matches(left: Path, right: object) -> bool:
+    right_path = Path(str(right))
+    if left == right_path:
+        return True
+    try:
+        return left.resolve(strict=False) == right_path.resolve(strict=False)
+    except OSError:
+        return False
+
+
+def _assign_testing_org_indices(
+    config: PipelineConfig,
+    org_datasets: list[OrgDataset],
+    run_config: dict[str, Any],
+) -> None:
+    resolved: list[int] | None = None
+    if config.org_indexes is not None:
+        resolved = list(config.org_indexes)
+    else:
+        trained_logs = run_config.get("org_data")
+        trained_groundtruth = run_config.get("org_groundtruth")
+        if isinstance(trained_logs, list) and isinstance(trained_groundtruth, list):
+            inferred: list[int] = []
+            for dataset in org_datasets:
+                matches = [
+                    index
+                    for index, (log_path, groundtruth_path) in enumerate(
+                        zip(trained_logs, trained_groundtruth)
+                    )
+                    if _path_matches(dataset.log_path, log_path)
+                    and _path_matches(dataset.groundtruth_path, groundtruth_path)
+                ]
+                if len(matches) != 1:
+                    inferred = []
+                    break
+                inferred.append(matches[0])
+            if len(inferred) == len(org_datasets) and len(set(inferred)) == len(inferred):
+                resolved = inferred
+
+    if resolved is None:
+        trained_logs = run_config.get("org_data")
+        trained_count = len(trained_logs) if isinstance(trained_logs, list) else None
+        if trained_count == len(org_datasets):
+            resolved = list(range(len(org_datasets)))
+        elif trained_count == 1 and len(org_datasets) == 1:
+            resolved = [0]
+        else:
+            raise ValueError(
+                "Could not map inference organization inputs to the saved training "
+                "organizations. Provide --org-indexes with one original artifact "
+                "organization index per input pair."
+            )
+
+    for dataset, org_index in zip(org_datasets, resolved):
+        dataset.org_index = int(org_index)
+        dataset.internal_log_ids = [
+            f"org_{org_index}_row_{row_index}" for row_index in dataset.row_indices
+        ]
+    LOGGER.info("Resolved inference organization indices: %s", resolved)
 
 
 def _prompt_for_missing_artifact(description: str, default_path: Path) -> Path:
@@ -170,8 +232,22 @@ def _apply_testing_fusion_override(
     fusion: ManualLogitFusion,
     config: PipelineConfig,
 ) -> ManualLogitFusion:
-    if config.ensemble_method is None:
+    coverage_aware = (
+        fusion.coverage_aware
+        if config.coverage_aware_fusion is None
+        else config.coverage_aware_fusion
+    )
+    if config.ensemble_method is None and coverage_aware == fusion.coverage_aware:
         return fusion
+
+    if config.ensemble_method is None:
+        LOGGER.info("Inference mode disabling coverage-aware specialist fusion")
+        return ManualLogitFusion(
+            labels=fusion.labels,
+            subcategories_by_label=fusion.subcategories_by_label,
+            weights_by_label=fusion.weights_by_label,
+            coverage_aware=coverage_aware,
+        )
 
     weights_by_label: dict[str, dict[str, float]] = {}
     for label in fusion.labels:
@@ -211,7 +287,7 @@ def _apply_testing_fusion_override(
         labels=fusion.labels,
         subcategories_by_label=fusion.subcategories_by_label,
         weights_by_label=weights_by_label,
-        coverage_aware=fusion.coverage_aware,
+        coverage_aware=coverage_aware,
     )
 
 
@@ -511,6 +587,7 @@ def load_testing_artifacts(
     assert manifest_path is not None
 
     run_config = dict(_read_json(run_config_path))
+    _assign_testing_org_indices(config, org_datasets, run_config)
     label_classes = _load_label_classes(label_classes_path)
     manifest = dict(_read_json(manifest_path))
     prf_namespace = run_config.get("prf_namespace")
@@ -603,12 +680,16 @@ def load_testing_artifacts(
             _read_json(baseline_path)
         )
         expected_org_indices = {dataset.org_index for dataset in org_datasets}
-        if set(benign_novelty_baselines) != expected_org_indices:
+        missing_baselines = expected_org_indices - set(benign_novelty_baselines)
+        if missing_baselines:
             raise ValueError(
-                "Benign novelty baseline organization indices do not match testing "
-                f"organizations: {sorted(benign_novelty_baselines)} != "
-                f"{sorted(expected_org_indices)}"
+                "Benign novelty baseline is missing inference organization indices: "
+                f"{sorted(missing_baselines)}"
             )
+        benign_novelty_baselines = {
+            org_index: benign_novelty_baselines[org_index]
+            for org_index in expected_org_indices
+        }
     cross_context = run_config.get("cross_context")
     if cross_context is None:
         context_window_minutes = 0.0
@@ -719,6 +800,7 @@ def load_testing_artifacts(
         label_classes=label_classes,
         specialists=specialists,
         fusion=fusion,
+        org_indices=tuple(dataset.org_index for dataset in org_datasets),
     )
 
 
@@ -1014,6 +1096,7 @@ def write_testing_outputs(
         {
             **config.to_json_dict(),
             "risk_threshold_used": risk_threshold,
+            "resolved_org_indices": list(artifacts.org_indices),
             "loaded_training_run_config": artifacts.run_config,
         },
     )
