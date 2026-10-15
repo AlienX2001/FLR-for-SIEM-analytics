@@ -323,7 +323,12 @@ def run_pipeline(config: PipelineConfig) -> None:
                 ],
             },
             "aggregation": {"weighting": config.aggregation_weighting},
-            "class_weight": {"mode": config.class_weight},
+            "class_weight": {
+                "mode": config.class_weight,
+                "scope": "per_organization",
+                "strength": config.class_weight_strength,
+                "max_ratio": config.class_weight_max_ratio,
+            },
             "fusion": {
                 "mode": hierarchy.fusion_mode,
                 "coverage_aware": hierarchy.coverage_aware,

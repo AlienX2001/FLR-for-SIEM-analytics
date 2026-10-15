@@ -129,9 +129,6 @@ def generate_ioc_outputs(
         for candidate in extract_iocs(normalized_log):
             indicator = make_indicator(
                 candidate,
-                internal_log_id=internal_log_id,
-                org_index=org_index,
-                row_index=row_index,
                 predicted_label=str(predicted_label) if predicted_label is not None else None,
                 risk_probability=float(risk_probability)
                 if risk_probability is not None

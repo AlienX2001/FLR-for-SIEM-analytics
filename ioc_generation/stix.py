@@ -33,9 +33,6 @@ def indicator_pattern(candidate: IndicatorCandidate) -> str:
 def make_indicator(
     candidate: IndicatorCandidate,
     *,
-    internal_log_id: str,
-    org_index: int,
-    row_index: int,
     predicted_label: str | None = None,
     risk_probability: float | None = None,
 ) -> dict[str, Any]:
@@ -47,16 +44,10 @@ def make_indicator(
         "created": DETERMINISTIC_TIMESTAMP,
         "modified": DETERMINISTIC_TIMESTAMP,
         "name": name,
-        "description": (
-            f"Generated from high-risk federated LR prediction {internal_log_id} "
-            f"(org {org_index}, row {row_index})."
-        ),
+        "description": "Generated from a high-risk federated LR prediction.",
         "pattern": indicator_pattern(candidate),
         "pattern_type": "stix",
         "labels": ["federated-lr", "high-risk-log", candidate.indicator_type],
-        "x_federated_lr_internal_log_id": internal_log_id,
-        "x_federated_lr_org_index": int(org_index),
-        "x_federated_lr_row_index": int(row_index),
     }
     if predicted_label is not None:
         indicator["x_federated_lr_predicted_label"] = predicted_label

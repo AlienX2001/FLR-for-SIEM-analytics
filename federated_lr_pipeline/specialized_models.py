@@ -2408,13 +2408,44 @@ def initialize_all_specialists(
     return specialists
 
 
-def _binary_class_weights(targets: np.ndarray) -> tuple[float, float]:
+def _binary_class_weights(
+    targets: np.ndarray,
+    *,
+    strength: float = 1.0,
+    max_ratio: float | None = None,
+) -> tuple[float, float]:
+    """Return normalized inverse-frequency weights for one local client.
+
+    ``strength`` tempers the standard balanced weights with an exponent. The
+    resulting pair is normalized so its empirical mean over this client's
+    targets remains one. ``max_ratio`` bounds relative, rather than absolute,
+    weighting before the same normalization.
+    """
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("class-weight strength must be in [0, 1]")
+    if max_ratio is not None and (not math.isfinite(max_ratio) or max_ratio < 1.0):
+        raise ValueError("class-weight maximum ratio must be at least 1")
+    targets = np.asarray(targets)
+    if np.any((targets != 0) & (targets != 1)):
+        raise ValueError("binary class weights require targets containing only 0 and 1")
     positives = float(np.sum(targets == 1))
     negatives = float(np.sum(targets == 0))
     total = positives + negatives
-    if positives == 0 or negatives == 0:
+    if total == 0 or positives == 0 or negatives == 0:
         return 1.0, 1.0
-    return total / (2.0 * positives), total / (2.0 * negatives)
+
+    positive_weight = (total / (2.0 * positives)) ** strength
+    negative_weight = (total / (2.0 * negatives)) ** strength
+    if max_ratio is not None:
+        if positive_weight > negative_weight * max_ratio:
+            positive_weight = negative_weight * max_ratio
+        elif negative_weight > positive_weight * max_ratio:
+            negative_weight = positive_weight * max_ratio
+
+    mean_weight = (
+        positives * positive_weight + negatives * negative_weight
+    ) / total
+    return positive_weight / mean_weight, negative_weight / mean_weight
 
 
 def _aggregate_specialist_updates(
@@ -2624,6 +2655,8 @@ def _run_prepared_specialist_job(job: PreparedSpecialistJob) -> tuple[Specialist
         "num_features": len(job.index_vector),
         "positive_class_weight": job.positive_class_weight,
         "negative_class_weight": job.negative_class_weight,
+        "positive_class_count": int(np.sum(job.train_targets == 1)),
+        "negative_class_count": int(np.sum(job.train_targets == 0)),
         "weight_coordinate_system": "tf",
         "local_feature_mode": "tfidf" if job.local_idf is not None else "tf",
         "sigmoid_input_lower_bound": local_result.sigmoid_input_lower_bound,
@@ -2645,17 +2678,6 @@ def train_specialist_round(
     config: PipelineConfig,
     feature_matrix_cache: FeatureMatrixCache | None = None,
 ) -> dict[str, Any]:
-    all_train_targets = np.concatenate(
-        [
-            (labels[split.train_indices] == label_index).astype(int)
-            for labels, split in zip(encoded_labels_by_org, splits)
-        ]
-    )
-    pos_weight, neg_weight = (
-        _binary_class_weights(all_train_targets)
-        if config.class_weight == "balanced"
-        else (1.0, 1.0)
-    )
     prepared_jobs: list[PreparedSpecialistJob] = []
     test_counts_by_org: dict[int, int] = {}
 
@@ -2669,9 +2691,19 @@ def train_specialist_round(
         )
     ):
         train_targets = (labels[split.train_indices] == label_index).astype(int)
+        pos_weight, neg_weight = (
+            _binary_class_weights(
+                train_targets,
+                strength=config.class_weight_strength,
+                max_ratio=config.class_weight_max_ratio,
+            )
+            if config.class_weight == "balanced"
+            else (1.0, 1.0)
+        )
         LOGGER.info(
             "Round %s/%s %s/%s org %s: building %s matrix "
-            "(train_rows=%s, test_rows=%s, local_features=%s)",
+            "(train_rows=%s, test_rows=%s, local_features=%s, "
+            "positive_rows=%s, negative_rows=%s, class_weights=(%.6g, %.6g))",
             round_index + 1,
             total_rounds,
             state.label,
@@ -2681,6 +2713,10 @@ def train_specialist_round(
             len(split.train_indices),
             len(split.test_indices),
             len(vocab_tokens),
+            int(np.sum(train_targets == 1)),
+            int(np.sum(train_targets == 0)),
+            pos_weight,
+            neg_weight,
         )
         X = _feature_matrix_for_rows(
             state=state,

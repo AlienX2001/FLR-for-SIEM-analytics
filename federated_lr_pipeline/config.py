@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -39,6 +40,8 @@ class PipelineConfig:
     num_workers: int = 1
     test_size: float = 0.2
     class_weight: str = "balanced"
+    class_weight_strength: float = 1.0
+    class_weight_max_ratio: float | None = None
     vocabulary_source: str = "train"
     aggregation_weighting: str = "sample_size"
     fusion_mode: str = "manual"
@@ -193,7 +196,28 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         "--class-weight",
         choices=("balanced", "none"),
         default="balanced",
-        help="Class weighting for local LR training. Default: balanced.",
+        help=(
+            "Class weighting for local LR training. 'balanced' computes weights "
+            "independently from each organization's one-vs-rest training labels."
+        ),
+    )
+    parser.add_argument(
+        "--class-weight-strength",
+        default=1.0,
+        type=float,
+        help=(
+            "Tempering exponent for local balanced weights: 0 disables their "
+            "effect, 1 applies full inverse-frequency balancing. Default: 1.0."
+        ),
+    )
+    parser.add_argument(
+        "--class-weight-max-ratio",
+        default=None,
+        type=float,
+        help=(
+            "Optional upper bound on the ratio between local positive and negative "
+            "class weights. Must be at least 1."
+        ),
     )
     parser.add_argument(
         "--vocabulary-source",
@@ -399,6 +423,20 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         )
     if not args.testing and not 0.0 < args.test_size < 1.0:
         parser.error("--test-size must be between 0 and 1")
+    if not args.testing and (
+        not math.isfinite(args.class_weight_strength)
+        or not 0.0 <= args.class_weight_strength <= 1.0
+    ):
+        parser.error("--class-weight-strength must be in [0, 1]")
+    if (
+        not args.testing
+        and args.class_weight_max_ratio is not None
+        and (
+            not math.isfinite(args.class_weight_max_ratio)
+            or args.class_weight_max_ratio < 1.0
+        )
+    ):
+        parser.error("--class-weight-max-ratio must be at least 1")
     if not args.testing and args.fusion_mode == "meta":
         parser.error("--fusion-mode meta is a placeholder and is not implemented yet")
     if args.use_global_model:
@@ -418,6 +456,9 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         "--regularization",
         "--batch-size",
         "--num-workers",
+        "--class-weight",
+        "--class-weight-strength",
+        "--class-weight-max-ratio",
         "--context-window-minutes",
         "--context-timestamp-epoch-field",
         "--context-timestamp-iso-field",
@@ -459,6 +500,8 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         num_workers=args.num_workers,
         test_size=args.test_size,
         class_weight=args.class_weight,
+        class_weight_strength=args.class_weight_strength,
+        class_weight_max_ratio=args.class_weight_max_ratio,
         vocabulary_source=args.vocabulary_source,
         aggregation_weighting=args.aggregation_weighting,
         fusion_mode=args.fusion_mode,

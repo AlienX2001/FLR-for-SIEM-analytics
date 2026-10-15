@@ -261,12 +261,21 @@ conda run -n LR python -m federated_lr_pipeline.run \
   --risk-threshold 0.5 \
   --test-size 0.2 \
   --class-weight balanced \
+  --class-weight-strength 1.0 \
+  --class-weight-max-ratio 20 \
   --aggregation-weighting sample_size \
   --context-window-minutes 15 \
   --context-timestamp-epoch-field event_time_epoch \
   --context-timestamp-iso-field event_time_iso \
   --output-dir outputs/run_001
 ```
+
+With `--class-weight balanced`, every organization computes inverse-frequency
+weights from its own one-vs-rest training split; label counts are not pooled.
+`--class-weight-strength` tempers the local weights (`0` means no weighting,
+`1` means full balancing), while optional `--class-weight-max-ratio` limits the
+relative weight assigned to a rare local class. Effective local counts and
+weights are recorded for every specialist and round in `training_metrics.json`.
 
 Optional hierarchy config:
 
