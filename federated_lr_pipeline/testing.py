@@ -193,7 +193,7 @@ def _load_label_classes(path: Path) -> list[str]:
 def _validate_groundtruth_labels(
     org_datasets: list[OrgDataset],
     label_classes: list[str],
-) -> None:
+) -> dict[int, list[str]]:
     known = set(label_classes)
     unknown: dict[int, list[str]] = {}
     for dataset in org_datasets:
@@ -201,10 +201,13 @@ def _validate_groundtruth_labels(
         if missing:
             unknown[dataset.org_index] = missing
     if unknown:
-        raise ValueError(
-            "Testing groundtruth contains labels that were not present during training: "
-            + json.dumps(unknown, sort_keys=True)
+        LOGGER.warning(
+            "Testing groundtruth contains labels that were not present during training: %s. "
+            "Inference will continue using only the labels present in the training artifacts; "
+            "rows with unknown groundtruth labels will be excluded from trained-class metrics.",
+            json.dumps(unknown, sort_keys=True),
         )
+    return unknown
 
 
 def _fusion_from_hierarchy(path: Path, label_classes: list[str]) -> ManualLogitFusion:
@@ -872,18 +875,19 @@ def run_testing_inference(
             log_context=f"Testing inference org {dataset.org_index}",
         )
         predictions = np.argmax(probabilities, axis=1)
-        for subcategory in subcategory_predictions:
-            subcategory_predictions[subcategory].extend(
-                _subcategory_predictions(
-                    logits_by_label=logits_by_label,
-                    label_classes=artifacts.label_classes,
-                    subcategory=subcategory,
-                ).tolist()
+        org_subcategory_predictions = {
+            subcategory: _subcategory_predictions(
+                logits_by_label=logits_by_label,
+                label_classes=artifacts.label_classes,
+                subcategory=subcategory,
             )
+            for subcategory in subcategory_predictions
+        }
 
         for row_index in range(len(dataset.labels)):
             true_label = str(dataset.labels[row_index])
-            true_index = label_to_index[true_label]
+            true_index = label_to_index.get(true_label)
+            groundtruth_label_known = true_index is not None
             predicted_index = int(predictions[row_index])
             predicted_label = artifacts.label_classes[predicted_index]
             subcategory_logits = {
@@ -921,9 +925,10 @@ def run_testing_inference(
                 "row_index": int(row_index),
                 "internal_log_id": dataset.internal_log_ids[row_index],
                 "true_label": true_label,
+                "groundtruth_label_known": groundtruth_label_known,
                 "predicted_label": predicted_label,
                 "ensemble_predicted_label": predicted_label,
-                "correct": bool(predicted_label == true_label),
+                "correct": bool(groundtruth_label_known and predicted_label == true_label),
                 "probabilities": _dict_from_row(probabilities[row_index], artifacts.label_classes),
                 "ensemble_probabilities": _dict_from_row(
                     probabilities[row_index],
@@ -942,8 +947,13 @@ def run_testing_inference(
             if source_log_id is not None:
                 record["source_log_id"] = source_log_id
             records.append(record)
-            y_true_indices.append(true_index)
-            y_pred_indices.append(predicted_index)
+            if groundtruth_label_known:
+                y_true_indices.append(int(true_index))
+                y_pred_indices.append(predicted_index)
+                for subcategory, subcategory_values in org_subcategory_predictions.items():
+                    subcategory_predictions[subcategory].append(
+                        int(subcategory_values[row_index])
+                    )
 
     return TestingInferenceResult(
         records=records,
@@ -962,6 +972,40 @@ def _metrics_for_predictions(
     label_classes: list[str],
 ) -> dict[str, Any]:
     labels = list(range(len(label_classes)))
+    if y_true.size == 0:
+        matrix = np.zeros((len(label_classes), len(label_classes)), dtype=int)
+        empty_class_metrics = {
+            label: {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1-score": 0.0,
+                "support": 0.0,
+            }
+            for label in label_classes
+        }
+        empty_average = {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1-score": 0.0,
+            "support": 0.0,
+        }
+        return {
+            "accuracy": None,
+            "macro_precision": 0.0,
+            "macro_recall": 0.0,
+            "macro_f1": 0.0,
+            "weighted_precision": 0.0,
+            "weighted_recall": 0.0,
+            "weighted_f1": 0.0,
+            "confusion_matrix": matrix.tolist(),
+            "classification_report": {
+                **empty_class_metrics,
+                "accuracy": None,
+                "macro avg": dict(empty_average),
+                "weighted avg": dict(empty_average),
+            },
+            "per_class_accuracy": {label: 0.0 for label in label_classes},
+        }
     macro = precision_recall_fscore_support(
         y_true,
         y_pred,
@@ -1011,6 +1055,21 @@ def compute_testing_metrics(
     result: TestingInferenceResult,
     label_classes: list[str],
 ) -> dict[str, Any]:
+    unknown_labels_by_org: dict[str, set[str]] = {}
+    for record in result.records:
+        if record["groundtruth_label_known"]:
+            continue
+        org_index = str(record["org_index"])
+        unknown_labels_by_org.setdefault(org_index, set()).add(str(record["true_label"]))
+
+    total_examples = len(result.records)
+    evaluated_examples = int(result.y_true_indices.size)
+    excluded_examples = total_examples - evaluated_examples
+    all_rows_accuracy = (
+        float(sum(bool(record["correct"]) for record in result.records) / total_examples)
+        if total_examples
+        else None
+    )
     subcategory_metrics = {
         subcategory: _metrics_for_predictions(
             result.y_true_indices,
@@ -1020,6 +1079,19 @@ def compute_testing_metrics(
         for subcategory, predictions in result.subcategory_pred_indices.items()
     }
     metrics: dict[str, Any] = {
+        "groundtruth_evaluation": {
+            "total_examples": total_examples,
+            "evaluated_known_label_examples": evaluated_examples,
+            "excluded_unknown_label_examples": excluded_examples,
+            "unknown_labels_by_org": {
+                org_index: sorted(labels)
+                for org_index, labels in sorted(unknown_labels_by_org.items())
+            },
+            "trained_class_metrics_scope": (
+                "Only rows whose groundtruth label is present in label_encoder_classes.json"
+            ),
+            "accuracy_all_rows_treating_unknown_labels_as_incorrect": all_rows_accuracy,
+        },
         "ensemble_model": _metrics_for_predictions(
             result.y_true_indices,
             result.y_pred_indices,
@@ -1041,6 +1113,11 @@ def _classification_report_text(
     y_pred: np.ndarray,
     label_classes: list[str],
 ) -> str:
+    if y_true.size == 0:
+        return (
+            "No testing rows had groundtruth labels present in the trained label set. "
+            "Inference outputs were generated, but trained-class evaluation metrics are undefined."
+        )
     labels = list(range(len(label_classes)))
     return classification_report(
         y_true,
@@ -1126,6 +1203,7 @@ def write_testing_outputs(
             "row_index": record["row_index"],
             "internal_log_id": record["internal_log_id"],
             "true_label": record["true_label"],
+            "groundtruth_label_known": record["groundtruth_label_known"],
             "ensemble_predicted_label": record["ensemble_predicted_label"],
             "correct": record["correct"],
             "ensemble_max_risk_probability": record["ensemble_max_risk_probability"],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -192,6 +193,48 @@ def test_testing_mode_skips_training_and_writes_metrics(tmp_path: Path, monkeypa
     assert "true_label" in first_explanation
     assert "ensemble_predicted_label" in first_explanation
     assert "top_contributing_features" in first_explanation
+
+
+def test_testing_mode_warns_and_infers_with_unknown_groundtruth_label(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    org_logs, org_labels, artifact_dir = _train_small_model(tmp_path)
+    labels = pd.read_csv(org_labels[0])
+    labels.loc[0, "label"] = "unseen_attack"
+    unknown_labels_path = tmp_path / "unknown_labels.csv"
+    labels.to_csv(unknown_labels_path, index=False)
+    output_dir = tmp_path / "testing_unknown_label"
+    config = replace(
+        _testing_config(
+            org_logs=[org_logs[0]],
+            org_labels=[unknown_labels_path],
+            artifact_dir=artifact_dir,
+            output_dir=output_dir,
+        ),
+        org_indexes=[0],
+    )
+
+    caplog.set_level("WARNING", logger="federated_lr_pipeline.testing")
+    run_pipeline(config)
+
+    assert "Testing groundtruth contains labels that were not present during training" in caplog.text
+    records = [
+        json.loads(line)
+        for line in (output_dir / "testing_predictions.jsonl").read_text().splitlines()
+    ]
+    unknown_record = records[0]
+    assert unknown_record["true_label"] == "unseen_attack"
+    assert unknown_record["groundtruth_label_known"] is False
+    assert unknown_record["correct"] is False
+    assert unknown_record["predicted_label"] in {"benign", "malicious"}
+
+    metrics = json.loads((output_dir / "testing_metrics.json").read_text())
+    evaluation = metrics["groundtruth_evaluation"]
+    assert evaluation["total_examples"] == 6
+    assert evaluation["evaluated_known_label_examples"] == 5
+    assert evaluation["excluded_unknown_label_examples"] == 1
+    assert evaluation["unknown_labels_by_org"] == {"0": ["unseen_attack"]}
 
 
 def test_testing_mode_auto_maps_single_saved_organization_subset(
