@@ -2313,9 +2313,27 @@ def initialize_specialist(
         org_token_counters = [build_token_counters(texts) for texts in org_texts]
     local_vocabularies: list[LocalVocabulary] = []
     for dataset, counters, split in zip(org_datasets, org_token_counters, splits):
+        vocabulary_source_indices = (
+            np.asarray(split.train_indices, dtype=int)
+            if vocabulary_source == "train"
+            else np.arange(len(counters), dtype=int)
+        )
+        covered_vocabulary_indices = _native_covered_row_indices(
+            counters,
+            vocabulary_source_indices,
+            subcategory,
+        )
+        LOGGER.info(
+            "%s/%s org %s vocabulary coverage: %s/%s rows",
+            label,
+            subcategory,
+            dataset.org_index,
+            len(covered_vocabulary_indices),
+            len(vocabulary_source_indices),
+        )
         if subcategory == "cross":
             active_tokens = set()
-            for counter in select_items(counters, split.train_indices):
+            for counter in select_items(counters, covered_vocabulary_indices):
                 active_tokens.update(counter.keys())
             df = {token: int(token in active_tokens) for token in CROSS_CATEGORY_TOKENS}
             local_vocabularies.append(
@@ -2323,16 +2341,12 @@ def initialize_specialist(
                     tokens=list(CROSS_CATEGORY_TOKENS),
                     document_frequency=df,
                     effective_min_df=1,
-                    effective_max_df_count=len(split.train_indices),
+                    effective_max_df_count=len(covered_vocabulary_indices),
                     used_fallback=False,
                 )
             )
             continue
-        vocabulary_counters = (
-            select_items(counters, split.train_indices)
-            if vocabulary_source == "train"
-            else counters
-        )
+        vocabulary_counters = select_items(counters, covered_vocabulary_indices)
         local_vocabularies.append(
             generate_local_vocabulary_from_token_counters(
                 vocabulary_counters,
@@ -2680,6 +2694,8 @@ def train_specialist_round(
 ) -> dict[str, Any]:
     prepared_jobs: list[PreparedSpecialistJob] = []
     test_counts_by_org: dict[int, int] = {}
+    coverage_counts_by_org: dict[int, tuple[int, int]] = {}
+    local_metrics_by_org: dict[int, dict[str, Any]] = {}
 
     for org_position, (dataset, labels, split, vocab_tokens, index_vector) in enumerate(
         zip(
@@ -2690,7 +2706,66 @@ def train_specialist_round(
             state.org_index_vectors,
         )
     ):
-        train_targets = (labels[split.train_indices] == label_index).astype(int)
+        available_train_indices = np.asarray(split.train_indices, dtype=int)
+        covered_train_indices = _locally_represented_covered_row_indices(
+            state.org_token_counters[org_position],
+            available_train_indices,
+            state.subcategory,
+            vocab_tokens,
+        )
+        available_count = len(available_train_indices)
+        covered_count = len(covered_train_indices)
+        coverage_rate = covered_count / available_count if available_count else 0.0
+        coverage_counts_by_org[dataset.org_index] = (covered_count, available_count)
+        test_counts_by_org[dataset.org_index] = len(split.test_indices)
+        if covered_count == 0:
+            LOGGER.warning(
+                "Round %s/%s %s/%s org %s: skipping local update because none "
+                "of the %s training rows has locally representable native coverage",
+                round_index + 1,
+                total_rounds,
+                state.label,
+                state.subcategory,
+                dataset.org_index,
+                available_count,
+            )
+            local_metrics_by_org[dataset.org_index] = {
+                "org_index": dataset.org_index,
+                "train_loss": None,
+                "local_train_accuracy": None,
+                "num_train_examples": 0,
+                "num_available_train_examples": available_count,
+                "num_covered_train_examples": 0,
+                "train_coverage_rate": coverage_rate,
+                "num_test_examples": len(split.test_indices),
+                "num_features": len(index_vector),
+                "positive_class_weight": 1.0,
+                "negative_class_weight": 1.0,
+                "positive_class_count": 0,
+                "negative_class_count": 0,
+                "weight_coordinate_system": "tf",
+                "local_feature_mode": mode,
+                "sigmoid_input_lower_bound": None,
+                "sigmoid_input_upper_bound": None,
+                "skipped_no_coverage": True,
+            }
+            continue
+
+        train_targets = (labels[covered_train_indices] == label_index).astype(int)
+        positive_count = int(np.sum(train_targets == 1))
+        negative_count = int(np.sum(train_targets == 0))
+        if positive_count == 0 or negative_count == 0:
+            LOGGER.warning(
+                "Round %s/%s %s/%s org %s covered training subset contains "
+                "only one binary class (positive_rows=%s, negative_rows=%s)",
+                round_index + 1,
+                total_rounds,
+                state.label,
+                state.subcategory,
+                dataset.org_index,
+                positive_count,
+                negative_count,
+            )
         pos_weight, neg_weight = (
             _binary_class_weights(
                 train_targets,
@@ -2702,7 +2777,7 @@ def train_specialist_round(
         )
         LOGGER.info(
             "Round %s/%s %s/%s org %s: building %s matrix "
-            "(train_rows=%s, test_rows=%s, local_features=%s, "
+            "(covered_train_rows=%s/%s, test_rows=%s, local_features=%s, "
             "positive_rows=%s, negative_rows=%s, class_weights=(%.6g, %.6g))",
             round_index + 1,
             total_rounds,
@@ -2710,18 +2785,19 @@ def train_specialist_round(
             state.subcategory,
             dataset.org_index,
             mode,
-            len(split.train_indices),
+            covered_count,
+            available_count,
             len(split.test_indices),
             len(vocab_tokens),
-            int(np.sum(train_targets == 1)),
-            int(np.sum(train_targets == 0)),
+            positive_count,
+            negative_count,
             pos_weight,
             neg_weight,
         )
         X = _feature_matrix_for_rows(
             state=state,
             org_position=org_position,
-            row_indices=split.train_indices,
+            row_indices=covered_train_indices,
             mode=mode,
             log_every=config.local_progress_interval,
             round_index=round_index,
@@ -2736,14 +2812,13 @@ def train_specialist_round(
         if mode == "tfidf":
             train_counters = select_items(
                 state.org_token_counters[org_position],
-                split.train_indices,
+                covered_train_indices,
             )
             local_idf = compute_local_idf(train_counters, vocab_tokens)
             local_initial_weights = tf_weights_to_tfidf(
                 server_tf_weights,
                 local_idf,
             )
-        test_counts_by_org[dataset.org_index] = len(split.test_indices)
         prepared_jobs.append(
             PreparedSpecialistJob(
                 org_position=org_position,
@@ -2773,10 +2848,16 @@ def train_specialist_round(
         results = [_run_prepared_specialist_job(job) for job in prepared_jobs]
 
     updates = [update for update, _ in results]
-    local_metrics = []
     for update, metrics in results:
+        covered_count, available_count = coverage_counts_by_org[update.org_index]
         metrics["num_test_examples"] = test_counts_by_org[update.org_index]
-        local_metrics.append(metrics)
+        metrics["num_available_train_examples"] = available_count
+        metrics["num_covered_train_examples"] = covered_count
+        metrics["train_coverage_rate"] = (
+            covered_count / available_count if available_count else 0.0
+        )
+        metrics["skipped_no_coverage"] = False
+        local_metrics_by_org[update.org_index] = metrics
         LOGGER.info(
             "Round %s/%s %s/%s org %s sigmoid input bounds: lower=%s upper=%s",
             round_index + 1,
@@ -2787,6 +2868,9 @@ def train_specialist_round(
             metrics["sigmoid_input_lower_bound"],
             metrics["sigmoid_input_upper_bound"],
         )
+    local_metrics = [
+        local_metrics_by_org[dataset.org_index] for dataset in org_datasets
+    ]
     state.weights, state.bias = _aggregate_specialist_updates(
         state.weights,
         state.bias,
@@ -2839,6 +2923,50 @@ def _token_field(token: str) -> str:
     colon_index = token.find(":")
     separators = [index for index in (equals_index, colon_index) if index >= 0]
     return token[: min(separators)] if separators else token
+
+
+def _native_covered_row_indices(
+    token_counters: Sequence[Mapping[str, int]],
+    row_indices: Sequence[int] | np.ndarray,
+    subcategory: str,
+) -> np.ndarray:
+    return np.asarray(
+        [
+            int(row_index)
+            for row_index in row_indices
+            if token_counter_has_subcategory_coverage(
+                token_counters[int(row_index)],
+                subcategory,
+            )
+        ],
+        dtype=int,
+    )
+
+
+def _locally_represented_covered_row_indices(
+    token_counters: Sequence[Mapping[str, int]],
+    row_indices: Sequence[int] | np.ndarray,
+    subcategory: str,
+    local_vocab_tokens: Sequence[str],
+) -> np.ndarray:
+    """Return rows with native evidence represented on the local model axis."""
+    coverage_fields = SUBCATEGORY_COVERAGE_ATTRIBUTES[subcategory]
+    local_vocabulary = set(local_vocab_tokens)
+    if not local_vocabulary:
+        return np.asarray([], dtype=int)
+    return np.asarray(
+        [
+            int(row_index)
+            for row_index in row_indices
+            if any(
+                count != 0
+                and token in local_vocabulary
+                and _token_field(token) in coverage_fields
+                for token, count in token_counters[int(row_index)].items()
+            )
+        ],
+        dtype=int,
+    )
 
 
 def token_counter_has_subcategory_coverage(

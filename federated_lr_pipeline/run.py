@@ -326,6 +326,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             "class_weight": {
                 "mode": config.class_weight,
                 "scope": "per_organization",
+                "population": "covered_training_rows_per_subcategory",
                 "strength": config.class_weight_strength,
                 "max_ratio": config.class_weight_max_ratio,
             },

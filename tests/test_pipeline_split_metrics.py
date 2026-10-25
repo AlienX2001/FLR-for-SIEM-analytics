@@ -160,6 +160,10 @@ def test_pipeline_reports_held_out_test_metrics_and_class_weights(tmp_path: Path
     assert metrics["split"]["test_size"] == 0.2
     assert metrics["class_weight"]["mode"] == "balanced"
     assert metrics["class_weight"]["scope"] == "per_organization"
+    assert (
+        metrics["class_weight"]["population"]
+        == "covered_training_rows_per_subcategory"
+    )
     assert metrics["class_weight"]["strength"] == 1.0
     assert metrics["class_weight"]["max_ratio"] is None
     assert metrics["context_features"]["version"] == 2

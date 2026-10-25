@@ -206,6 +206,16 @@ manual weighting, preventing learned specialist biases from favoring labels that
 merely configure more subcategories. The final prediction remains a single-stage
 softmax over the fused label logits.
 
+Specialist training uses the same principle. Each organization's local
+vocabulary, class weights, round-0 IDF values, and local LR update are computed
+from training rows with native evidence for that subcategory. A row enters a
+local update only when at least one native token is represented in that
+organization's local vocabulary. Organizations with no covered rows skip that
+specialist update. Under sample-size aggregation, each update is weighted by its
+covered-row count, so an organization's aggregation share can differ by
+subcategory. Held-out rows are not removed; coverage-aware fusion decides which
+specialists contribute to each evaluation or inference row.
+
 Training also writes `representation_diagnostics.json`. It hashes complete
 training representations and reports how often an identical representation is
 associated with multiple labels, including a majority-label ceiling. Only hashes
@@ -271,7 +281,9 @@ conda run -n LR python -m federated_lr_pipeline.run \
 ```
 
 With `--class-weight balanced`, every organization computes inverse-frequency
-weights from its own one-vs-rest training split; label counts are not pooled.
+weights from the covered rows in its own one-vs-rest specialist training split;
+label counts are not pooled. Consequently, class weights may differ both by
+organization and by subcategory.
 `--class-weight-strength` tempers the local weights (`0` means no weighting,
 `1` means full balancing), while optional `--class-weight-max-ratio` limits the
 relative weight assigned to a rare local class. Effective local counts and

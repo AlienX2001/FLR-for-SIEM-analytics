@@ -107,6 +107,35 @@ def test_labels_in_same_subcategory_share_gv_axis() -> None:
     assert data_state.org_index_vectors == credential_state.org_index_vectors
 
 
+def test_local_vocabulary_excludes_rows_without_native_subcategory_coverage() -> None:
+    split = Split(train_indices=np.array([0, 1]), test_indices=np.array([], dtype=int))
+    state = initialize_specialist(
+        label="credential_access",
+        subcategory="system",
+        org_datasets=[_dataset()],
+        org_texts=[
+            [
+                "context:uncovered_only",
+                "process_name=cmd context:covered_context",
+            ]
+        ],
+        missing_columns_by_org={0: []},
+        splits=[split],
+        num_features=10,
+        min_df=1,
+        max_df=1.0,
+        vocabulary_source="train",
+        prf_key=derive_prf_key(42),
+        seed=42,
+    )
+
+    vocabulary = state.local_vocabularies[0]
+    assert "context:uncovered_only" not in vocabulary.tokens
+    assert "process_name=cmd" in vocabulary.tokens
+    assert "context:covered_context" in vocabulary.tokens
+    assert vocabulary.effective_max_df_count == 1
+
+
 def test_inference_uses_global_token_missing_from_organization_lv() -> None:
     key = derive_prf_key(42)
     split = Split(train_indices=np.array([0]), test_indices=np.array([], dtype=int))
@@ -114,7 +143,7 @@ def test_inference_uses_global_token_missing_from_organization_lv() -> None:
         label="credential_access",
         subcategory="network",
         org_datasets=[_dataset(0), _dataset(1)],
-        org_texts=[["alpha"], ["beta"]],
+        org_texts=[["src_ip=alpha"], ["src_ip=beta"]],
         missing_columns_by_org={0: [], 1: []},
         splits=[split, split],
         num_features=1,
@@ -124,17 +153,17 @@ def test_inference_uses_global_token_missing_from_organization_lv() -> None:
         prf_key=key,
         seed=42,
     )
-    assert "beta" not in state.org_vocab_tokens[0]
+    assert "src_ip=beta" not in state.org_vocab_tokens[0]
     beta_tag = tag_namespaced_vocabulary(
-        ["beta"], key, subcategory="network"
+        ["src_ip=beta"], key, subcategory="network"
     )[0]
     beta_index = state.global_tags.index(beta_tag)
     state.weights[:] = 0.0
     state.weights[beta_index] = 2.5
     state.bias = 0.0
 
-    query_counter = build_token_counters(["beta"])[0]
-    state.org_texts[0] = ["beta"]
+    query_counter = build_token_counters(["src_ip=beta"])[0]
+    state.org_texts[0] = ["src_ip=beta"]
     state.org_token_counters[0] = [query_counter]
     X, logits = logits_for_org_rows(state, 0, np.array([0]))
 
@@ -148,7 +177,7 @@ def test_inference_uses_global_token_missing_from_organization_lv() -> None:
         row_token_counter=query_counter,
         debug_plaintext_vocab=True,
     )
-    assert contributions[0]["token"] == "beta"
+    assert contributions[0]["token"] == "src_ip=beta"
     assert contributions[0]["tag"] == beta_tag
     assert contributions[0]["gv_index"] == beta_index
     assert contributions[0]["contribution"] == 2.5
@@ -161,7 +190,7 @@ def test_inference_still_drops_token_absent_from_global_vocabulary() -> None:
         label="credential_access",
         subcategory="network",
         org_datasets=[_dataset(0)],
-        org_texts=[["alpha"]],
+        org_texts=[["src_ip=alpha"]],
         missing_columns_by_org={0: []},
         splits=[split],
         num_features=1,
@@ -172,8 +201,8 @@ def test_inference_still_drops_token_absent_from_global_vocabulary() -> None:
         seed=42,
     )
     state.bias = 0.75
-    state.org_texts[0] = ["never-seen"]
-    state.org_token_counters[0] = build_token_counters(["never-seen"])
+    state.org_texts[0] = ["src_ip=never-seen"]
+    state.org_token_counters[0] = build_token_counters(["src_ip=never-seen"])
 
     X, logits = logits_for_org_rows(state, 0, np.array([0]))
 
