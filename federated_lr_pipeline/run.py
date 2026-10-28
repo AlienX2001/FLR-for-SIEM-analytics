@@ -9,7 +9,11 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
-from federated_lr_pipeline.config import PipelineConfig, parse_args
+from federated_lr_pipeline.config import (
+    PipelineConfig,
+    parse_args,
+    resolve_org_evidence_categories,
+)
 from federated_lr_pipeline.data import OrgDataset, load_all_orgs
 from federated_lr_pipeline.ensemble import ManualLogitFusion
 from federated_lr_pipeline.prf import derive_prf_key
@@ -185,6 +189,37 @@ def run_pipeline(config: PipelineConfig) -> None:
 
     LOGGER.info("Building subcategory field-aware inputs")
     active_subcategories = active_subcategories_for_hierarchy(hierarchy)
+    org_evidence_categories = resolve_org_evidence_categories(
+        config.org_evidence_categories,
+        org_count=len(org_datasets),
+        default_categories=active_subcategories,
+    )
+    resolved_category_lists = [
+        [
+            subcategory
+            for subcategory in active_subcategories
+            if subcategory in categories
+        ]
+        for categories in org_evidence_categories
+    ]
+    for dataset, categories in zip(org_datasets, resolved_category_lists):
+        if not categories:
+            raise ValueError(
+                f"Organization {dataset.org_index} evidence categories do not intersect "
+                f"the active hierarchy categories: {', '.join(active_subcategories)}"
+            )
+    run_config_payload["org_evidence_categories"] = resolved_category_lists
+    run_config_payload["coverage_policy"] = {
+        "version": 1,
+        "mode": "organization_declared",
+    }
+    write_json(output_dir / "run_config.json", run_config_payload)
+    for dataset, categories in zip(org_datasets, resolved_category_lists):
+        LOGGER.info(
+            "Organization %s declared evidence categories: %s",
+            dataset.org_index,
+            ", ".join(categories),
+        )
     texts_by_subcategory, missing_by_subcategory = build_subcategory_texts(
         org_datasets,
         subcategories=active_subcategories,
@@ -201,6 +236,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         splits=splits,
         token_counters_by_subcategory=token_counters_by_subcategory,
         subcategories=active_subcategories,
+        org_evidence_categories=org_evidence_categories,
     )
     write_json(
         output_dir / "representation_diagnostics.json",
@@ -226,6 +262,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         splits=splits,
         config=config,
         prf_key=prf_key,
+        org_evidence_categories=org_evidence_categories,
     )
     fusion = ManualLogitFusion(
         labels=hierarchy.labels,
@@ -266,6 +303,7 @@ def run_pipeline(config: PipelineConfig) -> None:
                     total_rounds=total_rounds,
                     config=config,
                     feature_matrix_cache=train_feature_matrix_cache,
+                    org_evidence_categories=org_evidence_categories,
                 )
 
         test_feature_matrix_cache = {}
@@ -276,6 +314,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             splits=splits,
             class_names=label_classes,
             feature_matrix_cache=test_feature_matrix_cache,
+            org_evidence_categories=org_evidence_categories,
         )
         metrics_by_round.append(
             {
@@ -323,10 +362,24 @@ def run_pipeline(config: PipelineConfig) -> None:
                 ],
             },
             "aggregation": {"weighting": config.aggregation_weighting},
+            "coverage_policy": {
+                "version": 1,
+                "mode": "organization_declared",
+                "per_org": [
+                    {
+                        "org_index": dataset.org_index,
+                        "evidence_categories": categories,
+                    }
+                    for dataset, categories in zip(
+                        org_datasets,
+                        resolved_category_lists,
+                    )
+                ],
+            },
             "class_weight": {
                 "mode": config.class_weight,
                 "scope": "per_organization",
-                "population": "covered_training_rows_per_subcategory",
+                "population": "organization_declared_training_rows_per_subcategory",
                 "strength": config.class_weight_strength,
                 "max_ratio": config.class_weight_max_ratio,
             },
@@ -349,6 +402,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         label_classes=label_classes,
         risk_threshold=config.risk_threshold,
         debug_plaintext_vocab=config.debug_plaintext_vocab,
+        org_evidence_categories=org_evidence_categories,
     )
     write_hierarchical_inference_outputs(prediction_records, output_dir)
     LOGGER.info("Wrote outputs to %s", output_dir)

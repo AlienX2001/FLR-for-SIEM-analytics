@@ -17,7 +17,7 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
 )
 
-from federated_lr_pipeline.config import PipelineConfig
+from federated_lr_pipeline.config import PipelineConfig, resolve_org_evidence_categories
 from federated_lr_pipeline.data import OrgDataset, load_all_orgs
 from federated_lr_pipeline.ensemble import ManualLogitFusion, fused_probabilities
 from federated_lr_pipeline.feature_schemas import (
@@ -55,6 +55,7 @@ class TestingArtifacts:
     specialists: dict[str, dict[str, SpecialistState]]
     fusion: ManualLogitFusion
     org_indices: tuple[int, ...]
+    org_evidence_categories: tuple[frozenset[str], ...]
 
 
 @dataclass(frozen=True)
@@ -654,6 +655,50 @@ def load_testing_artifacts(
             for subcategory in fusion.subcategories_by_label[label]
         }
     )
+    coverage_policy = run_config.get("coverage_policy")
+    if coverage_policy != {"version": 1, "mode": "organization_declared"}:
+        raise ValueError(
+            "Testing artifacts do not use organization-declared evidence coverage. "
+            "Retrain with the current pipeline before inference."
+        )
+    if config.org_evidence_categories is not None:
+        org_evidence_categories = resolve_org_evidence_categories(
+            config.org_evidence_categories,
+            org_count=len(org_datasets),
+            default_categories=active_subcategories,
+        )
+    else:
+        saved_categories = run_config.get("org_evidence_categories")
+        if not isinstance(saved_categories, list) or not saved_categories:
+            raise ValueError(
+                "run_config.json is missing organization evidence-category declarations"
+            )
+        saved_resolved = resolve_org_evidence_categories(
+            saved_categories,
+            org_count=len(saved_categories),
+            default_categories=active_subcategories,
+        )
+        org_evidence_categories = []
+        for dataset in org_datasets:
+            if dataset.org_index >= len(saved_resolved):
+                raise ValueError(
+                    f"Organization index {dataset.org_index} has no saved evidence-category "
+                    "declaration; provide --org-evidence-categories explicitly"
+                )
+            org_evidence_categories.append(saved_resolved[dataset.org_index])
+    for dataset, categories in zip(org_datasets, org_evidence_categories):
+        active_for_org = sorted(set(categories).intersection(active_subcategories))
+        if not active_for_org:
+            raise ValueError(
+                f"Inference organization {dataset.org_index} evidence categories do not "
+                "intersect the trained hierarchy categories: "
+                + ", ".join(active_subcategories)
+            )
+        LOGGER.info(
+            "Inference organization %s declared evidence categories: %s",
+            dataset.org_index,
+            ", ".join(active_for_org),
+        )
     benign_novelty_baselines = {}
     if "cross" in active_subcategories:
         baseline_metadata = run_config.get("benign_novelty_baseline")
@@ -804,6 +849,7 @@ def load_testing_artifacts(
         specialists=specialists,
         fusion=fusion,
         org_indices=tuple(dataset.org_index for dataset in org_datasets),
+        org_evidence_categories=tuple(org_evidence_categories),
     )
 
 
@@ -867,6 +913,7 @@ def run_testing_inference(
             include_features=False,
             feature_matrix_cache=feature_matrix_cache,
             cache_partition="testing_all",
+            covered_subcategories=artifacts.org_evidence_categories[org_position],
         )
         label_logits, probabilities = fused_probabilities(
             artifacts.fusion,
@@ -906,6 +953,12 @@ def run_testing_inference(
             if max_probability >= risk_threshold:
                 contributions_for_prediction[predicted_label] = {}
                 for subcategory, state in artifacts.specialists[predicted_label].items():
+                    if (
+                        artifacts.fusion.coverage_aware
+                        and subcategory
+                        not in artifacts.org_evidence_categories[org_position]
+                    ):
+                        continue
                     X_row, _ = logits_for_org_rows(
                         state,
                         org_position,
@@ -1174,6 +1227,9 @@ def write_testing_outputs(
             **config.to_json_dict(),
             "risk_threshold_used": risk_threshold,
             "resolved_org_indices": list(artifacts.org_indices),
+            "resolved_org_evidence_categories": [
+                sorted(categories) for categories in artifacts.org_evidence_categories
+            ],
             "loaded_training_run_config": artifacts.run_config,
         },
     )

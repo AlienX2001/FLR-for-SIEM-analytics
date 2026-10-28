@@ -233,7 +233,7 @@ def test_specialist_round_computes_class_weights_per_organization() -> None:
     np.testing.assert_allclose(org1["negative_class_weight"], 2.0)
 
 
-def test_specialist_round_uses_only_locally_covered_training_rows() -> None:
+def test_specialist_round_uses_all_rows_for_declared_category() -> None:
     texts = [
         "process_name=covered",
         "src_ip=uncovered",
@@ -306,13 +306,14 @@ def test_specialist_round_uses_only_locally_covered_training_rows() -> None:
 
     local = metrics["local_metrics"][0]
     assert local["num_available_train_examples"] == 4
-    assert local["num_covered_train_examples"] == 3
-    assert local["num_train_examples"] == 3
-    assert local["train_coverage_rate"] == 0.75
-    assert (local["positive_class_count"], local["negative_class_count"]) == (1, 2)
-    np.testing.assert_allclose(local["positive_class_weight"], 1.5)
-    np.testing.assert_allclose(local["negative_class_weight"], 0.75)
+    assert local["num_covered_train_examples"] == 4
+    assert local["num_train_examples"] == 4
+    assert local["train_coverage_rate"] == 1.0
+    assert (local["positive_class_count"], local["negative_class_count"]) == (2, 2)
+    np.testing.assert_allclose(local["positive_class_weight"], 1.0)
+    np.testing.assert_allclose(local["negative_class_weight"], 1.0)
     assert local["skipped_no_coverage"] is False
+    assert local["skipped_undeclared_category"] is False
 
 
 def test_specialist_round_skips_client_with_no_covered_rows() -> None:
@@ -378,6 +379,7 @@ def test_specialist_round_skips_client_with_no_covered_rows() -> None:
         round_index=0,
         total_rounds=1,
         config=config,
+        org_evidence_categories=[frozenset({"network"})],
     )
 
     np.testing.assert_array_equal(state.weights, initial_weights)
@@ -385,4 +387,5 @@ def test_specialist_round_skips_client_with_no_covered_rows() -> None:
     local = metrics["local_metrics"][0]
     assert local["num_train_examples"] == 0
     assert local["skipped_no_coverage"] is True
+    assert local["skipped_undeclared_category"] is True
     assert local["train_loss"] is None

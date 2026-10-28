@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from federated_lr_pipeline.feature_schemas import (
     CROSS_VOCABULARY_SHA256,
     CROSS_VOCABULARY_SIZE,
     CROSS_VOCABULARY_VERSION,
+    SUBCATEGORY_NAMES,
 )
 from federated_lr_pipeline.numeric_features import numeric_bucketing_metadata
 
@@ -46,6 +48,7 @@ class PipelineConfig:
     aggregation_weighting: str = "sample_size"
     fusion_mode: str = "manual"
     coverage_aware_fusion: bool | None = None
+    org_evidence_categories: list[list[str]] | None = None
     use_global_model: bool = False
     debug_plaintext_vocab: bool = False
     context_window_minutes: float = 15.0
@@ -137,6 +140,82 @@ def _prompt_path(prompt: str, parser: argparse.ArgumentParser) -> Path:
     return Path(raw_value)
 
 
+def _parse_org_evidence_categories(
+    raw_specs: Sequence[str] | None,
+    parser: argparse.ArgumentParser,
+) -> list[list[str]] | None:
+    if raw_specs is None:
+        return None
+    parsed: list[list[str]] = []
+    supported = set(SUBCATEGORY_NAMES)
+    for org_position, raw_spec in enumerate(raw_specs):
+        values = [value.strip().lower() for value in raw_spec.split(",") if value.strip()]
+        if values == ["all"]:
+            values = list(SUBCATEGORY_NAMES)
+        elif "all" in values:
+            parser.error(
+                "Use 'all' by itself in each --org-evidence-categories entry"
+            )
+        if not values:
+            parser.error(
+                "Each --org-evidence-categories entry must contain at least one category"
+            )
+        invalid = sorted(set(values) - supported)
+        if invalid:
+            parser.error(
+                "Unsupported evidence categories for organization position "
+                f"{org_position}: {', '.join(invalid)}. Supported values: "
+                + ", ".join(SUBCATEGORY_NAMES)
+            )
+        if len(values) != len(set(values)):
+            parser.error(
+                "Duplicate evidence category for organization position "
+                f"{org_position}: {raw_spec}"
+            )
+        parsed.append(values)
+    return parsed
+
+
+def resolve_org_evidence_categories(
+    configured: Sequence[Sequence[str]] | None,
+    *,
+    org_count: int,
+    default_categories: Sequence[str],
+) -> list[frozenset[str]]:
+    values = (
+        [list(default_categories) for _ in range(org_count)]
+        if configured is None
+        else [list(categories) for categories in configured]
+    )
+    if len(values) != org_count:
+        raise ValueError(
+            "Organization evidence-category declarations must contain exactly one "
+            f"entry per organization: expected {org_count}, received {len(values)}"
+        )
+    supported = set(SUBCATEGORY_NAMES)
+    resolved: list[frozenset[str]] = []
+    for org_position, categories in enumerate(values):
+        normalized = [str(category).strip().lower() for category in categories]
+        if normalized == ["all"]:
+            normalized = list(SUBCATEGORY_NAMES)
+        if not normalized:
+            raise ValueError(
+                f"Organization position {org_position} must declare at least one evidence category"
+            )
+        invalid = sorted(set(normalized) - supported)
+        if invalid:
+            raise ValueError(
+                f"Organization position {org_position} declares unsupported evidence "
+                f"categories: {', '.join(invalid)}"
+            )
+        if len(normalized) != len(set(normalized)):
+            raise ValueError(
+                f"Organization position {org_position} declares duplicate evidence categories"
+            )
+        resolved.append(frozenset(normalized))
+    return resolved
+
+
 def parse_args(argv: list[str] | None = None) -> PipelineConfig:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     provided_flags = {
@@ -150,6 +229,19 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
     parser.add_argument("--inference", dest="testing", action="store_true")
     parser.add_argument("--org-data", nargs="+", type=Path)
     parser.add_argument("--org-groundtruth", nargs="+", type=Path)
+    parser.add_argument(
+        "--org-evidence-categories",
+        nargs="+",
+        default=None,
+        metavar="CATEGORY[,CATEGORY...]",
+        help=(
+            "One comma-separated evidence-category declaration per organization, in "
+            "--org-data order. Supported categories: system, network, llm, identity, "
+            "cloud, cross. Use 'all' for every category. When omitted during training, "
+            "all categories active in the hierarchy are declared; inference reuses the "
+            "saved declarations unless this option overrides them."
+        ),
+    )
     parser.add_argument(
         "--org-indexes",
         nargs="+",
@@ -361,6 +453,18 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
 
     if len(args.org_data) != len(args.org_groundtruth):
         parser.error("--org-data and --org-groundtruth must contain the same number of files")
+    args.org_evidence_categories = _parse_org_evidence_categories(
+        args.org_evidence_categories,
+        parser,
+    )
+    if (
+        args.org_evidence_categories is not None
+        and len(args.org_evidence_categories) != len(args.org_data)
+    ):
+        parser.error(
+            "--org-evidence-categories must contain exactly one comma-separated "
+            "entry per --org-data file"
+        )
     if args.org_indexes is not None:
         if not args.testing:
             parser.error("--org-indexes is only supported with --inference")
@@ -472,6 +576,7 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         "--debug-plaintext-vocab",
         "--fuse-all-specialists",
         "--disable-coverage-aware-fusion",
+        "--org-evidence-categories",
     }
     ignored_testing_parameters = sorted(training_flags & provided_flags) if args.testing else []
     testing_override_parameters = sorted(testing_override_flags & provided_flags)
@@ -506,6 +611,7 @@ def parse_args(argv: list[str] | None = None) -> PipelineConfig:
         aggregation_weighting=args.aggregation_weighting,
         fusion_mode=args.fusion_mode,
         coverage_aware_fusion=args.coverage_aware_fusion,
+        org_evidence_categories=args.org_evidence_categories,
         use_global_model=args.use_global_model,
         debug_plaintext_vocab=args.debug_plaintext_vocab,
         context_window_minutes=args.context_window_minutes,

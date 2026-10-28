@@ -150,6 +150,7 @@ def test_pipeline_reports_held_out_test_metrics_and_class_weights(tmp_path: Path
             local_epochs=1,
             test_size=0.2,
             class_weight="balanced",
+            org_evidence_categories=[["system"], ["network"]],
             risk_threshold=0.0,
             debug_plaintext_vocab=True,
         )
@@ -162,7 +163,7 @@ def test_pipeline_reports_held_out_test_metrics_and_class_weights(tmp_path: Path
     assert metrics["class_weight"]["scope"] == "per_organization"
     assert (
         metrics["class_weight"]["population"]
-        == "covered_training_rows_per_subcategory"
+        == "organization_declared_training_rows_per_subcategory"
     )
     assert metrics["class_weight"]["strength"] == 1.0
     assert metrics["class_weight"]["max_ratio"] is None
@@ -185,6 +186,16 @@ def test_pipeline_reports_held_out_test_metrics_and_class_weights(tmp_path: Path
     assert "sigmoid_input_upper_bound" in first_specialist["local_metrics"][0]
     assert "positive_class_count" in first_specialist["local_metrics"][0]
     assert "negative_class_count" in first_specialist["local_metrics"][0]
+    assert first_specialist["local_metrics"][0]["num_train_examples"] > 0
+    assert first_specialist["local_metrics"][1]["num_train_examples"] == 0
+    coverage_org0 = final_round["ensemble_metrics"]["per_org"][0]["coverage_rates"][
+        "benign"
+    ]
+    coverage_org1 = final_round["ensemble_metrics"]["per_org"][1]["coverage_rates"][
+        "benign"
+    ]
+    assert coverage_org0 == {"cross": 0.0, "network": 0.0, "system": 1.0}
+    assert coverage_org1 == {"cross": 0.0, "network": 1.0, "system": 0.0}
     assert (output_dir / "hierarchical_model_manifest.json").exists()
     assert (output_dir / "representation_diagnostics.json").exists()
     assert (output_dir / "manual_logit_fusion.json").exists()

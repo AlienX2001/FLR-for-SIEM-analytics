@@ -83,7 +83,7 @@ Plaintext tokens are not needed by the global vocabulary builder. Use `--debug-p
 ### Global Inference Projection
 
 Local vocabularies constrain federated training updates, but they do not constrain
-inference coverage. During inference, the local SIEM tokenizes every query row,
+global feature projection. During inference, the local SIEM tokenizes every query row,
 computes `PRF(subcategory|token)` for every observed token, and projects matching
 tags directly into the complete global vocabulary. A token learned from another
 organization can therefore contribute to the current organization's prediction
@@ -153,7 +153,7 @@ Window summaries are label-independent and causal: they use no groundtruth,
 future event, prediction, or absolute timestamp value. A row receives context for
 a specialist only when that row contains native evidence for that specialist.
 Surrounding network activity therefore does not manufacture system, identity,
-LLM, or cloud coverage for a row that lacks those fields.
+LLM, or cloud context features for a row that lacks those fields.
 
 The causal state also measures flow count, distinct destinations, distinct
 destination ports, cumulative transfer size, and repeated destinations. These
@@ -197,24 +197,23 @@ changed with `--context-timestamp-epoch-field` and
 
 ### Coverage-Aware Fusion
 
-Before label logits are fused, each specialist receives a per-row coverage flag.
-A specialist is covered only when at least one feature native to its subcategory
-is present in that specialist's global PRF vocabulary. For example, source and
-destination IPs alone count as network evidence and do not activate an identity
-or cloud specialist. Uncovered specialist logits are replaced with zero before
-manual weighting, preventing learned specialist biases from favoring labels that
-merely configure more subcategories. The final prediction remains a single-stage
-softmax over the fused label logits.
+Coverage is declared by each organization rather than inferred from individual
+tokens. `--org-evidence-categories` accepts one comma-separated declaration per
+organization in `--org-data` order. For example, `system,cross network,cross`
+declares system and cross coverage for the first organization and network and
+cross coverage for the second. Supported categories are `system`, `network`,
+`llm`, `identity`, `cloud`, and `cross`; `all` enables all six. When the option
+is omitted during training, every subcategory used by the hierarchy is declared.
 
-Specialist training uses the same principle. Each organization's local
-vocabulary, class weights, round-0 IDF values, and local LR update are computed
-from training rows with native evidence for that subcategory. A row enters a
-local update only when at least one native token is represented in that
-organization's local vocabulary. Organizations with no covered rows skip that
-specialist update. Under sample-size aggregation, each update is weighted by its
-covered-row count, so an organization's aggregation share can differ by
-subcategory. Held-out rows are not removed; coverage-aware fusion decides which
-specialists contribute to each evaluation or inference row.
+An organization trains a specialist on its complete local training split when
+that specialist's category is declared. Its class weights, round-0 IDF values,
+and sample-size aggregation weight therefore use the full local split. It does
+not submit an update for undeclared categories. During evaluation and inference,
+a declared specialist is enabled for every row from that organization and an
+undeclared specialist is disabled for every row. Disabled logits are replaced
+with zero before manual weighting. The declarations are stored in
+`run_config.json`; inference reuses them unless an explicit
+`--org-evidence-categories` override is supplied.
 
 Training also writes `representation_diagnostics.json`. It hashes complete
 training representations and reports how often an identical representation is
@@ -263,6 +262,7 @@ Running LR training:
 conda run -n LR python -m federated_lr_pipeline.run \
   --org-data examples/orgA_logs.csv examples/orgB_logs.csv examples/orgC_logs.csv \
   --org-groundtruth examples/orgA_groundtruth.csv examples/orgB_groundtruth.csv examples/orgC_groundtruth.csv \
+  --org-evidence-categories system,cross network,cross system,network,cross \
   --label-column "Tactic Name" \
   --num-features 20 \
   --federation-iterations 5 \
@@ -281,9 +281,8 @@ conda run -n LR python -m federated_lr_pipeline.run \
 ```
 
 With `--class-weight balanced`, every organization computes inverse-frequency
-weights from the covered rows in its own one-vs-rest specialist training split;
-label counts are not pooled. Consequently, class weights may differ both by
-organization and by subcategory.
+weights from its complete local split for each declared one-vs-rest specialist;
+label counts are not pooled. Undeclared organization/category pairs do not train.
 `--class-weight-strength` tempers the local weights (`0` means no weighting,
 `1` means full balancing), while optional `--class-weight-max-ratio` limits the
 relative weight assigned to a rare local class. Effective local counts and
@@ -325,7 +324,7 @@ conda run -n LR python -m federated_lr_pipeline.run \
   --output-dir outputs/test_run_001
 ```
 
-Inference mode loads saved specialist weights, global PRF-tag vocabularies, per-organization index vectors, label classes, fusion metadata, benign novelty baselines, and the training-time cross-context settings. It does not regenerate vocabularies, train local models, aggregate parameters, initialize new models, or write new trained weights. Inference from raw logs requires saved local vocabulary tokens; run the training job with `--debug-plaintext-vocab` when you need later standalone inference from CSV inputs. When the hierarchy uses cross specialists, inference rejects older artifact directories that do not contain compatible cross-context and benign-baseline metadata because their features cannot be reproduced exactly.
+Inference mode loads saved specialist weights, global PRF-tag vocabularies, per-organization index vectors, label classes, fusion metadata, organization evidence-category declarations, benign novelty baselines, and the training-time cross-context settings. It does not regenerate vocabularies, train local models, aggregate parameters, initialize new models, or write new trained weights. Inference from raw logs requires saved local vocabulary tokens; run the training job with `--debug-plaintext-vocab` when you need later standalone inference from CSV inputs. Artifacts trained before organization-declared coverage was introduced must be retrained.
 
 Inference may evaluate only a subset of the organizations represented by an
 artifact directory. Inputs whose log and groundtruth paths match the saved
@@ -333,9 +332,11 @@ training paths are mapped automatically. If files were renamed or relocated,
 pass their original artifact indices explicitly, for example
 `--org-indexes 1` for only the second training organization.
 
-Coverage-aware fusion is enabled by default and suppresses a specialist's logit
-when the row has no projected evidence for that subcategory. For an ablation
-that fuses every configured specialist regardless of evidence coverage, add:
+Coverage-aware fusion is enabled by default and suppresses specialist logits for
+categories not declared by the current organization. To override saved
+declarations for inference inputs, provide one entry per input, for example
+`--org-evidence-categories system,cross network,cross`. For an ablation that
+fuses every configured specialist regardless of organization declarations, add:
 
 ```bash
 --fuse-all-specialists

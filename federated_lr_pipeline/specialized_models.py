@@ -2169,16 +2169,26 @@ def representation_ambiguity_diagnostics(
     splits: Sequence[Any],
     token_counters_by_subcategory: Mapping[str, list[list[Counter[str]]]],
     subcategories: Sequence[str],
+    org_evidence_categories: Sequence[frozenset[str]] | None = None,
 ) -> dict[str, Any]:
     per_org: list[dict[str, Any]] = []
     for org_position, (dataset, split) in enumerate(zip(org_datasets, splits)):
+        org_subcategories = (
+            subcategories
+            if org_evidence_categories is None
+            else [
+                subcategory
+                for subcategory in subcategories
+                if subcategory in org_evidence_categories[org_position]
+            ]
+        )
         all_groups: dict[bytes, Counter[str]] = {}
         for raw_row_index in split.train_indices:
             row_index = int(raw_row_index)
             label = str(dataset.labels[row_index])
             digest = _representation_digest(
                 token_counters_by_subcategory=token_counters_by_subcategory,
-                subcategories=subcategories,
+                subcategories=org_subcategories,
                 org_position=org_position,
                 row_index=row_index,
             )
@@ -2186,6 +2196,7 @@ def representation_ambiguity_diagnostics(
         per_org.append(
             {
                 "org_index": dataset.org_index,
+                "declared_evidence_categories": sorted(org_subcategories),
                 "all_training_rows": _collision_summary(all_groups),
                 "non_benign_training_rows": _collision_summary(
                     all_groups,
@@ -2195,7 +2206,7 @@ def representation_ambiguity_diagnostics(
         )
     return {
         "version": 1,
-        "representation": "all-active-subcategory-token-counters",
+        "representation": "organization-declared-subcategory-token-counters",
         "per_org": per_org,
     }
 
@@ -2308,26 +2319,34 @@ def initialize_specialist(
     prf_key: bytes,
     seed: int,
     org_token_counters: list[list[Counter[str]]] | None = None,
+    org_evidence_categories: Sequence[frozenset[str]] | None = None,
 ) -> SpecialistState:
     if org_token_counters is None:
         org_token_counters = [build_token_counters(texts) for texts in org_texts]
     local_vocabularies: list[LocalVocabulary] = []
-    for dataset, counters, split in zip(org_datasets, org_token_counters, splits):
+    for org_position, (dataset, counters, split) in enumerate(
+        zip(org_datasets, org_token_counters, splits)
+    ):
+        category_declared = (
+            org_evidence_categories is None
+            or subcategory in org_evidence_categories[org_position]
+        )
         vocabulary_source_indices = (
             np.asarray(split.train_indices, dtype=int)
             if vocabulary_source == "train"
             else np.arange(len(counters), dtype=int)
         )
-        covered_vocabulary_indices = _native_covered_row_indices(
-            counters,
-            vocabulary_source_indices,
-            subcategory,
+        covered_vocabulary_indices = (
+            vocabulary_source_indices
+            if category_declared
+            else np.asarray([], dtype=int)
         )
         LOGGER.info(
-            "%s/%s org %s vocabulary coverage: %s/%s rows",
+            "%s/%s org %s declared=%s vocabulary rows=%s/%s",
             label,
             subcategory,
             dataset.org_index,
+            category_declared,
             len(covered_vocabulary_indices),
             len(vocabulary_source_indices),
         )
@@ -2399,6 +2418,7 @@ def initialize_all_specialists(
     splits: list[Any],
     config: PipelineConfig,
     prf_key: bytes,
+    org_evidence_categories: Sequence[frozenset[str]] | None = None,
 ) -> dict[str, dict[str, SpecialistState]]:
     specialists: dict[str, dict[str, SpecialistState]] = {}
     for label in hierarchy.labels:
@@ -2418,6 +2438,7 @@ def initialize_all_specialists(
                 vocabulary_source=config.vocabulary_source,
                 prf_key=prf_key,
                 seed=config.seed,
+                org_evidence_categories=org_evidence_categories,
             )
     return specialists
 
@@ -2691,6 +2712,7 @@ def train_specialist_round(
     total_rounds: int,
     config: PipelineConfig,
     feature_matrix_cache: FeatureMatrixCache | None = None,
+    org_evidence_categories: Sequence[frozenset[str]] | None = None,
 ) -> dict[str, Any]:
     prepared_jobs: list[PreparedSpecialistJob] = []
     test_counts_by_org: dict[int, int] = {}
@@ -2707,11 +2729,14 @@ def train_specialist_round(
         )
     ):
         available_train_indices = np.asarray(split.train_indices, dtype=int)
-        covered_train_indices = _locally_represented_covered_row_indices(
-            state.org_token_counters[org_position],
-            available_train_indices,
-            state.subcategory,
-            vocab_tokens,
+        category_declared = (
+            org_evidence_categories is None
+            or state.subcategory in org_evidence_categories[org_position]
+        )
+        covered_train_indices = (
+            available_train_indices
+            if category_declared
+            else np.asarray([], dtype=int)
         )
         available_count = len(available_train_indices)
         covered_count = len(covered_train_indices)
@@ -2720,14 +2745,13 @@ def train_specialist_round(
         test_counts_by_org[dataset.org_index] = len(split.test_indices)
         if covered_count == 0:
             LOGGER.warning(
-                "Round %s/%s %s/%s org %s: skipping local update because none "
-                "of the %s training rows has locally representable native coverage",
+                "Round %s/%s %s/%s org %s: skipping local update because the "
+                "organization did not declare this evidence category",
                 round_index + 1,
                 total_rounds,
                 state.label,
                 state.subcategory,
                 dataset.org_index,
-                available_count,
             )
             local_metrics_by_org[dataset.org_index] = {
                 "org_index": dataset.org_index,
@@ -2736,7 +2760,9 @@ def train_specialist_round(
                 "num_train_examples": 0,
                 "num_available_train_examples": available_count,
                 "num_covered_train_examples": 0,
+                "num_declared_train_examples": 0,
                 "train_coverage_rate": coverage_rate,
+                "category_declared": False,
                 "num_test_examples": len(split.test_indices),
                 "num_features": len(index_vector),
                 "positive_class_weight": 1.0,
@@ -2748,6 +2774,7 @@ def train_specialist_round(
                 "sigmoid_input_lower_bound": None,
                 "sigmoid_input_upper_bound": None,
                 "skipped_no_coverage": True,
+                "skipped_undeclared_category": True,
             }
             continue
 
@@ -2777,7 +2804,7 @@ def train_specialist_round(
         )
         LOGGER.info(
             "Round %s/%s %s/%s org %s: building %s matrix "
-            "(covered_train_rows=%s/%s, test_rows=%s, local_features=%s, "
+            "(declared_train_rows=%s/%s, test_rows=%s, local_features=%s, "
             "positive_rows=%s, negative_rows=%s, class_weights=(%.6g, %.6g))",
             round_index + 1,
             total_rounds,
@@ -2853,10 +2880,13 @@ def train_specialist_round(
         metrics["num_test_examples"] = test_counts_by_org[update.org_index]
         metrics["num_available_train_examples"] = available_count
         metrics["num_covered_train_examples"] = covered_count
+        metrics["num_declared_train_examples"] = covered_count
         metrics["train_coverage_rate"] = (
             covered_count / available_count if available_count else 0.0
         )
+        metrics["category_declared"] = True
         metrics["skipped_no_coverage"] = False
+        metrics["skipped_undeclared_category"] = False
         local_metrics_by_org[update.org_index] = metrics
         LOGGER.info(
             "Round %s/%s %s/%s org %s sigmoid input bounds: lower=%s upper=%s",
@@ -2918,111 +2948,6 @@ def logits_for_org_rows(
     return X, binary_logits(X, state.weights, state.bias)
 
 
-def _token_field(token: str) -> str:
-    equals_index = token.find("=")
-    colon_index = token.find(":")
-    separators = [index for index in (equals_index, colon_index) if index >= 0]
-    return token[: min(separators)] if separators else token
-
-
-def _native_covered_row_indices(
-    token_counters: Sequence[Mapping[str, int]],
-    row_indices: Sequence[int] | np.ndarray,
-    subcategory: str,
-) -> np.ndarray:
-    return np.asarray(
-        [
-            int(row_index)
-            for row_index in row_indices
-            if token_counter_has_subcategory_coverage(
-                token_counters[int(row_index)],
-                subcategory,
-            )
-        ],
-        dtype=int,
-    )
-
-
-def _locally_represented_covered_row_indices(
-    token_counters: Sequence[Mapping[str, int]],
-    row_indices: Sequence[int] | np.ndarray,
-    subcategory: str,
-    local_vocab_tokens: Sequence[str],
-) -> np.ndarray:
-    """Return rows with native evidence represented on the local model axis."""
-    coverage_fields = SUBCATEGORY_COVERAGE_ATTRIBUTES[subcategory]
-    local_vocabulary = set(local_vocab_tokens)
-    if not local_vocabulary:
-        return np.asarray([], dtype=int)
-    return np.asarray(
-        [
-            int(row_index)
-            for row_index in row_indices
-            if any(
-                count != 0
-                and token in local_vocabulary
-                and _token_field(token) in coverage_fields
-                for token, count in token_counters[int(row_index)].items()
-            )
-        ],
-        dtype=int,
-    )
-
-
-def token_counter_has_subcategory_coverage(
-    counter: Mapping[str, int],
-    subcategory: str,
-) -> bool:
-    coverage_fields = SUBCATEGORY_COVERAGE_ATTRIBUTES[subcategory]
-    return any(
-        count != 0 and _token_field(token) in coverage_fields
-        for token, count in counter.items()
-    )
-
-
-def _coverage_for_org_rows(
-    *,
-    state: SpecialistState,
-    org_position: int,
-    row_indices: np.ndarray,
-    feature_matrix: sparse.csr_matrix,
-) -> np.ndarray:
-    counters = select_items(state.org_token_counters[org_position], row_indices)
-    coverage_fields = SUBCATEGORY_COVERAGE_ATTRIBUTES[state.subcategory]
-    candidate_tokens = sorted(
-        {
-            token
-            for counter in counters
-            for token, count in counter.items()
-            if count != 0 and _token_field(token) in coverage_fields
-        }
-    )
-    candidate_tags = tag_namespaced_vocabulary(
-        candidate_tokens,
-        state.prf_key,
-        subcategory=state.subcategory,
-    )
-    global_tags = set(state.global_tags)
-    projected_native_tokens = {
-        token
-        for token, tag in zip(candidate_tokens, candidate_tags)
-        if tag in global_tags
-    }
-    native_evidence = np.fromiter(
-        (
-            any(
-                count != 0 and token in projected_native_tokens
-                for token, count in counter.items()
-            )
-            for counter in counters
-        ),
-        dtype=bool,
-        count=len(counters),
-    )
-    projected_evidence = np.asarray(feature_matrix.getnnz(axis=1)).ravel() > 0
-    return native_evidence & projected_evidence
-
-
 def collect_logits_for_rows(
     specialists: dict[str, dict[str, SpecialistState]],
     org_position: int,
@@ -3031,6 +2956,7 @@ def collect_logits_for_rows(
     include_features: bool = False,
     feature_matrix_cache: FeatureMatrixCache | None = None,
     cache_partition: str | None = None,
+    covered_subcategories: frozenset[str] | None = None,
 ) -> tuple[
     dict[str, dict[str, np.ndarray]],
     dict[str, dict[str, np.ndarray]],
@@ -3039,7 +2965,11 @@ def collect_logits_for_rows(
     logits: dict[str, dict[str, np.ndarray]] = {}
     features: dict[str, dict[str, np.ndarray]] = {}
     coverage: dict[str, dict[str, np.ndarray]] = {}
-    coverage_cache: dict[tuple[str, tuple[str, ...]], np.ndarray] = {}
+    declared_categories = (
+        frozenset(SUBCATEGORY_NAMES)
+        if covered_subcategories is None
+        else covered_subcategories
+    )
     for label, by_subcategory in specialists.items():
         logits[label] = {}
         features[label] = {}
@@ -3055,15 +2985,11 @@ def collect_logits_for_rows(
             if include_features:
                 features[label][subcategory] = X
             logits[label][subcategory] = sub_logits
-            coverage_key = (subcategory, tuple(state.global_tags))
-            if coverage_key not in coverage_cache:
-                coverage_cache[coverage_key] = _coverage_for_org_rows(
-                    state=state,
-                    org_position=org_position,
-                    row_indices=row_indices,
-                    feature_matrix=X,
-                )
-            coverage[label][subcategory] = coverage_cache[coverage_key]
+            coverage[label][subcategory] = np.full(
+                len(row_indices),
+                subcategory in declared_categories,
+                dtype=bool,
+            )
     return logits, features, coverage
 
 
@@ -3075,6 +3001,7 @@ def evaluate_hierarchical_ensemble(
     splits: list[Any],
     class_names: list[str],
     feature_matrix_cache: FeatureMatrixCache | None = None,
+    org_evidence_categories: Sequence[frozenset[str]] | None = None,
 ) -> dict[str, Any]:
     labels_all: list[int] = []
     predictions_all: list[int] = []
@@ -3089,6 +3016,11 @@ def evaluate_hierarchical_ensemble(
             include_features=False,
             feature_matrix_cache=feature_matrix_cache,
             cache_partition="test",
+            covered_subcategories=(
+                None
+                if org_evidence_categories is None
+                else org_evidence_categories[org_position]
+            ),
         )
         label_logits, probabilities = fused_probabilities(
             fusion,
@@ -3207,6 +3139,7 @@ def generate_hierarchical_predictions(
     label_classes: list[str],
     risk_threshold: float,
     debug_plaintext_vocab: bool,
+    org_evidence_categories: Sequence[frozenset[str]] | None = None,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for org_position, dataset in enumerate(org_datasets):
@@ -3218,6 +3151,11 @@ def generate_hierarchical_predictions(
             include_features=False,
             feature_matrix_cache={},
             cache_partition="predict_all",
+            covered_subcategories=(
+                None
+                if org_evidence_categories is None
+                else org_evidence_categories[org_position]
+            ),
         )
         label_logits, probabilities = fused_probabilities(
             fusion,
@@ -3247,6 +3185,12 @@ def generate_hierarchical_predictions(
             if high_risk:
                 contributions_for_prediction[predicted_label] = {}
                 for subcategory, state in specialists[predicted_label].items():
+                    if (
+                        fusion.coverage_aware
+                        and org_evidence_categories is not None
+                        and subcategory not in org_evidence_categories[org_position]
+                    ):
+                        continue
                     X_row, _ = logits_for_org_rows(
                         state,
                         org_position,

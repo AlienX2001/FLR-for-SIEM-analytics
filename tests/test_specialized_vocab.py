@@ -107,7 +107,7 @@ def test_labels_in_same_subcategory_share_gv_axis() -> None:
     assert data_state.org_index_vectors == credential_state.org_index_vectors
 
 
-def test_local_vocabulary_excludes_rows_without_native_subcategory_coverage() -> None:
+def test_local_vocabulary_is_empty_for_undeclared_category() -> None:
     split = Split(train_indices=np.array([0, 1]), test_indices=np.array([], dtype=int))
     state = initialize_specialist(
         label="credential_access",
@@ -127,13 +127,13 @@ def test_local_vocabulary_excludes_rows_without_native_subcategory_coverage() ->
         vocabulary_source="train",
         prf_key=derive_prf_key(42),
         seed=42,
+        org_evidence_categories=[frozenset({"network"})],
     )
 
     vocabulary = state.local_vocabularies[0]
-    assert "context:uncovered_only" not in vocabulary.tokens
-    assert "process_name=cmd" in vocabulary.tokens
-    assert "context:covered_context" in vocabulary.tokens
-    assert vocabulary.effective_max_df_count == 1
+    assert vocabulary.tokens == []
+    assert vocabulary.document_frequency == {}
+    assert vocabulary.effective_max_df_count == 0
 
 
 def test_inference_uses_global_token_missing_from_organization_lv() -> None:
