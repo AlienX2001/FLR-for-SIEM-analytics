@@ -8,6 +8,7 @@ from federated_lr_pipeline.data import OrgDataset
 from federated_lr_pipeline.prf import derive_prf_key, tag_namespaced_vocabulary
 from federated_lr_pipeline.local_training import build_token_counters
 from federated_lr_pipeline.specialized_models import (
+    collect_logits_for_rows,
     initialize_specialist,
     logits_for_org_rows,
     top_contributions,
@@ -205,6 +206,12 @@ def test_inference_still_drops_token_absent_from_global_vocabulary() -> None:
     state.org_token_counters[0] = build_token_counters(["src_ip=never-seen"])
 
     X, logits = logits_for_org_rows(state, 0, np.array([0]))
+    _, _, coverage = collect_logits_for_rows(
+        {"credential_access": {"network": state}},
+        0,
+        np.array([0]),
+    )
 
     assert X.nnz == 0
     np.testing.assert_allclose(logits, [0.75])
+    assert coverage["credential_access"]["network"].tolist() == [True]

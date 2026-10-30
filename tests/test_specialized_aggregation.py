@@ -233,10 +233,10 @@ def test_specialist_round_computes_class_weights_per_organization() -> None:
     np.testing.assert_allclose(org1["negative_class_weight"], 2.0)
 
 
-def test_specialist_round_uses_only_locally_covered_training_rows() -> None:
+def test_specialist_round_coverage_does_not_require_local_vocabulary_membership() -> None:
     texts = [
         "process_name=covered",
-        "src_ip=uncovered",
+        "process_name=outside_local_vocabulary",
         "process_name=covered",
         "process_name=covered",
     ]
@@ -306,12 +306,12 @@ def test_specialist_round_uses_only_locally_covered_training_rows() -> None:
 
     local = metrics["local_metrics"][0]
     assert local["num_available_train_examples"] == 4
-    assert local["num_covered_train_examples"] == 3
-    assert local["num_train_examples"] == 3
-    assert local["train_coverage_rate"] == 0.75
-    assert (local["positive_class_count"], local["negative_class_count"]) == (1, 2)
-    np.testing.assert_allclose(local["positive_class_weight"], 1.5)
-    np.testing.assert_allclose(local["negative_class_weight"], 0.75)
+    assert local["num_covered_train_examples"] == 4
+    assert local["num_train_examples"] == 4
+    assert local["train_coverage_rate"] == 1.0
+    assert (local["positive_class_count"], local["negative_class_count"]) == (2, 2)
+    np.testing.assert_allclose(local["positive_class_weight"], 1.0)
+    np.testing.assert_allclose(local["negative_class_weight"], 1.0)
     assert local["skipped_no_coverage"] is False
 
 

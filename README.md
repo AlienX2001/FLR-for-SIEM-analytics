@@ -199,22 +199,23 @@ changed with `--context-timestamp-epoch-field` and
 
 Before label logits are fused, each specialist receives a per-row coverage flag.
 A specialist is covered only when at least one feature native to its subcategory
-is present in that specialist's global PRF vocabulary. For example, source and
-destination IPs alone count as network evidence and do not activate an identity
-or cloud specialist. Uncovered specialist logits are replaced with zero before
-manual weighting, preventing learned specialist biases from favoring labels that
-merely configure more subcategories. The final prediction remains a single-stage
-softmax over the fused label logits.
+is present in the row. Coverage does not depend on whether that token appears in
+the organization's LV or the federated GV. For example, source and destination
+IPs count as network evidence even when their exact tokens were not selected into
+a vocabulary, but they do not activate an identity or cloud specialist.
+Uncovered specialist logits are replaced with zero before manual weighting. The
+final prediction remains a single-stage softmax over the fused label logits.
 
 Specialist training uses the same principle. Each organization's local
 vocabulary, class weights, round-0 IDF values, and local LR update are computed
 from training rows with native evidence for that subcategory. A row enters a
-local update only when at least one native token is represented in that
-organization's local vocabulary. Organizations with no covered rows skip that
-specialist update. Under sample-size aggregation, each update is weighted by its
-covered-row count, so an organization's aggregation share can differ by
-subcategory. Held-out rows are not removed; coverage-aware fusion decides which
-specialists contribute to each evaluation or inference row.
+local update whenever it contains a native token, even if its resulting local
+feature vector is empty because that token is outside the LV. Organizations with
+no native-covered rows skip that specialist update. Under sample-size
+aggregation, each update is weighted by its native-covered row count, so an
+organization's aggregation share can differ by subcategory. Held-out rows are
+not removed; the same native-token predicate determines which specialists
+contribute to each evaluation or inference row.
 
 Training also writes `representation_diagnostics.json`. It hashes complete
 training representations and reports how often an identical representation is
@@ -334,8 +335,9 @@ pass their original artifact indices explicitly, for example
 `--org-indexes 1` for only the second training organization.
 
 Coverage-aware fusion is enabled by default and suppresses a specialist's logit
-when the row has no projected evidence for that subcategory. For an ablation
-that fuses every configured specialist regardless of evidence coverage, add:
+when the row has no native token for that subcategory. LV/GV membership does not
+affect this mask. For an ablation that fuses every configured specialist
+regardless of native evidence coverage, add:
 
 ```bash
 --fuse-all-specialists

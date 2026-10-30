@@ -2707,11 +2707,10 @@ def train_specialist_round(
         )
     ):
         available_train_indices = np.asarray(split.train_indices, dtype=int)
-        covered_train_indices = _locally_represented_covered_row_indices(
+        covered_train_indices = _native_covered_row_indices(
             state.org_token_counters[org_position],
             available_train_indices,
             state.subcategory,
-            vocab_tokens,
         )
         available_count = len(available_train_indices)
         covered_count = len(covered_train_indices)
@@ -2721,7 +2720,7 @@ def train_specialist_round(
         if covered_count == 0:
             LOGGER.warning(
                 "Round %s/%s %s/%s org %s: skipping local update because none "
-                "of the %s training rows has locally representable native coverage",
+                "of the %s training rows has native subcategory coverage",
                 round_index + 1,
                 total_rounds,
                 state.label,
@@ -2943,32 +2942,6 @@ def _native_covered_row_indices(
     )
 
 
-def _locally_represented_covered_row_indices(
-    token_counters: Sequence[Mapping[str, int]],
-    row_indices: Sequence[int] | np.ndarray,
-    subcategory: str,
-    local_vocab_tokens: Sequence[str],
-) -> np.ndarray:
-    """Return rows with native evidence represented on the local model axis."""
-    coverage_fields = SUBCATEGORY_COVERAGE_ATTRIBUTES[subcategory]
-    local_vocabulary = set(local_vocab_tokens)
-    if not local_vocabulary:
-        return np.asarray([], dtype=int)
-    return np.asarray(
-        [
-            int(row_index)
-            for row_index in row_indices
-            if any(
-                count != 0
-                and token in local_vocabulary
-                and _token_field(token) in coverage_fields
-                for token, count in token_counters[int(row_index)].items()
-            )
-        ],
-        dtype=int,
-    )
-
-
 def token_counter_has_subcategory_coverage(
     counter: Mapping[str, int],
     subcategory: str,
@@ -2985,42 +2958,19 @@ def _coverage_for_org_rows(
     state: SpecialistState,
     org_position: int,
     row_indices: np.ndarray,
-    feature_matrix: sparse.csr_matrix,
 ) -> np.ndarray:
     counters = select_items(state.org_token_counters[org_position], row_indices)
-    coverage_fields = SUBCATEGORY_COVERAGE_ATTRIBUTES[state.subcategory]
-    candidate_tokens = sorted(
-        {
-            token
-            for counter in counters
-            for token, count in counter.items()
-            if count != 0 and _token_field(token) in coverage_fields
-        }
-    )
-    candidate_tags = tag_namespaced_vocabulary(
-        candidate_tokens,
-        state.prf_key,
-        subcategory=state.subcategory,
-    )
-    global_tags = set(state.global_tags)
-    projected_native_tokens = {
-        token
-        for token, tag in zip(candidate_tokens, candidate_tags)
-        if tag in global_tags
-    }
-    native_evidence = np.fromiter(
+    return np.fromiter(
         (
-            any(
-                count != 0 and token in projected_native_tokens
-                for token, count in counter.items()
+            token_counter_has_subcategory_coverage(
+                counter,
+                state.subcategory,
             )
             for counter in counters
         ),
         dtype=bool,
         count=len(counters),
     )
-    projected_evidence = np.asarray(feature_matrix.getnnz(axis=1)).ravel() > 0
-    return native_evidence & projected_evidence
 
 
 def collect_logits_for_rows(
@@ -3039,7 +2989,7 @@ def collect_logits_for_rows(
     logits: dict[str, dict[str, np.ndarray]] = {}
     features: dict[str, dict[str, np.ndarray]] = {}
     coverage: dict[str, dict[str, np.ndarray]] = {}
-    coverage_cache: dict[tuple[str, tuple[str, ...]], np.ndarray] = {}
+    coverage_cache: dict[str, np.ndarray] = {}
     for label, by_subcategory in specialists.items():
         logits[label] = {}
         features[label] = {}
@@ -3055,13 +3005,12 @@ def collect_logits_for_rows(
             if include_features:
                 features[label][subcategory] = X
             logits[label][subcategory] = sub_logits
-            coverage_key = (subcategory, tuple(state.global_tags))
+            coverage_key = subcategory
             if coverage_key not in coverage_cache:
                 coverage_cache[coverage_key] = _coverage_for_org_rows(
                     state=state,
                     org_position=org_position,
                     row_indices=row_indices,
-                    feature_matrix=X,
                 )
             coverage[label][subcategory] = coverage_cache[coverage_key]
     return logits, features, coverage
