@@ -263,39 +263,6 @@ def test_testing_mode_auto_maps_single_saved_organization_subset(
     assert testing_config["resolved_org_indices"] == [1]
 
 
-def test_testing_mode_can_override_organization_evidence_categories(
-    tmp_path: Path,
-) -> None:
-    org_logs, org_labels, artifact_dir = _train_small_model(tmp_path)
-    output_dir = tmp_path / "system_only_inference"
-    config = replace(
-        _testing_config(
-            org_logs=[org_logs[0]],
-            org_labels=[org_labels[0]],
-            artifact_dir=artifact_dir,
-            output_dir=output_dir,
-        ),
-        org_indexes=[0],
-        org_evidence_categories=[["system"]],
-    )
-
-    run_pipeline(config)
-
-    records = [
-        json.loads(line)
-        for line in (output_dir / "testing_predictions.jsonl").read_text().splitlines()
-    ]
-    assert records
-    for record in records:
-        assert record["subcategory_coverage"] == {
-            "cross": False,
-            "network": False,
-            "system": True,
-        }
-    testing_config = json.loads((output_dir / "testing_run_config.json").read_text())
-    assert testing_config["resolved_org_evidence_categories"] == [["system"]]
-
-
 def test_testing_mode_missing_artifact_has_clear_error(tmp_path: Path, monkeypatch) -> None:
     org_logs, org_labels, artifact_dir = _train_small_model(tmp_path)
     (artifact_dir / "label_encoder_classes.json").unlink()

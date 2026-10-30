@@ -13,6 +13,7 @@ from federated_lr_pipeline.specialized_models import (
     build_specialized_texts_for_org,
     field_aware_tokens,
     representation_ambiguity_diagnostics,
+    token_counter_has_subcategory_coverage,
 )
 
 
@@ -194,3 +195,14 @@ def test_representation_diagnostics_detect_conflicting_labels() -> None:
     assert attack["num_unique_representations"] == 2
     assert attack["rows_in_ambiguous_representations"] == 2
     assert attack["exact_representation_majority_ceiling"] == 2 / 3
+
+
+def test_identity_coverage_requires_identity_native_evidence() -> None:
+    assert not token_counter_has_subcategory_coverage(
+        Counter({"src_ip=10.0.0.1": 1, "dst_ip=10.0.0.2": 1}),
+        "identity",
+    )
+    assert token_counter_has_subcategory_coverage(
+        Counter({"src_ip=10.0.0.1": 1, "user_uid=1001": 1}),
+        "identity",
+    )

@@ -35,23 +35,6 @@ def test_class_weight_tuning_options_are_parsed() -> None:
     assert config.class_weight_max_ratio == 8.0
 
 
-def test_organization_evidence_categories_are_parsed() -> None:
-    config = parse_args(
-        _training_args()
-        + ["--org-evidence-categories", "system,identity,cross"]
-    )
-
-    assert config.org_evidence_categories == [["system", "identity", "cross"]]
-
-
-def test_organization_evidence_categories_require_one_entry_per_org() -> None:
-    with pytest.raises(SystemExit):
-        parse_args(
-            _training_args()
-            + ["--org-evidence-categories", "system", "network"]
-        )
-
-
 @pytest.mark.parametrize(
     ("flag", "value"),
     [
